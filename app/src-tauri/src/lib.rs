@@ -352,6 +352,17 @@ fn crack_cancel(job: State<'_, JobSlot>) -> Result<(), String> {
     }
 }
 
+// 启动参数里带来的归档路径（文件管理器双击 / `rosezip-app foo.zip`）
+#[tauri::command]
+fn startup_path() -> Option<String> {
+    std::env::args().nth(1).filter(|p| !p.starts_with('-'))
+}
+
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -370,7 +381,9 @@ pub fn run() {
             estimate_space,
             crack_start,
             crack_status,
-            crack_cancel
+            crack_cancel,
+            startup_path,
+            app_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
