@@ -1,0 +1,12 @@
+[package]
+name = "rosezip-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rosezip"
+path = "src/main.rs"
+
+[dependencies]
+rosezip-core = { path = "../core" }
+clap = { workspace = true }
