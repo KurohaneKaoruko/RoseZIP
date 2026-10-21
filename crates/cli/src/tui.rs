@@ -513,6 +513,7 @@ fn action_bench(tui: &mut Tui) -> io::Result<String> {
         crc32: 0x11223344,
         is_dir: false,
         dos_time: 0x98b,
+        dos_date: 0x5B99,
     };
     let verifier = Arc::new(
         rosezip_core::zipcrypt::Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x98b))

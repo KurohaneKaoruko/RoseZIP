@@ -31,22 +31,30 @@ export function Modal({ title, icon, onClose, children, footer, wide }) {
   );
 }
 
-/** 解压弹窗：目录 + 密码 + 结果。 */
-export function ExtractDialog({ path, defaultDest, onClose, onDone }) {
-  const [dest, setDest] = useState(defaultDest || "");
-  const [password, setPassword] = useState("");
+/** 解压弹窗：目录 + 密码 + 结果。支持只解压选中项。 */
+export function ExtractDialog({ path, names, presetPassword, defaultDest, onClose, onDone }) {
+  const [dest, setDest] = useState(() => {
+    try {
+      return localStorage.getItem("rosezip.lastDest") || defaultDest || "";
+    } catch {
+      return defaultDest || "";
+    }
+  });
+  const [password, setPassword] = useState(presetPassword || "");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
 
   async function run() {
     setBusy(true);
     setResult(null);
+    const target = dest.trim() || defaultDest;
     try {
-      const r = await invoke("extract_archive", {
-        path,
-        dest: dest.trim() || defaultDest,
-        password: password || null,
-      });
+      localStorage.setItem("rosezip.lastDest", target);
+    } catch { /* ignore */ }
+    try {
+      const r = names
+        ? await invoke("extract_selected", { path, names, dest: target, password: password || null })
+        : await invoke("extract_archive", { path, dest: target, password: password || null });
       setResult(r);
       if (r.ok && r.errors.length === 0) onDone?.(r);
     } catch (e) {
@@ -73,6 +81,14 @@ export function ExtractDialog({ path, defaultDest, onClose, onDone }) {
       }
     >
       <div className="form-rows">
+        {names && names.length > 0 && (
+          <div className="frow">
+            <span className="frow-label">范围</span>
+            <div className="frow-main sel-hint">
+              只解压选中的 <b>{names.length}</b> 个条目
+            </div>
+          </div>
+        )}
         <label className="frow">
           <span className="frow-label">输出目录</span>
           <input

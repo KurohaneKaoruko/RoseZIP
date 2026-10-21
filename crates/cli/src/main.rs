@@ -60,6 +60,12 @@ enum Cmd {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// Test archive integrity (decode everything, verify checksums)
+    Test {
+        file: std::path::PathBuf,
+        #[arg(short, long)]
+        password: Option<String>,
+    },
 }
 
 fn main() {
