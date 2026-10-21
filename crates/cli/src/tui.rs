@@ -104,6 +104,9 @@ mod raw {
     }
 }
 
+#[cfg(not(unix))]
+use raw::RawGuard;
+
 struct Tui {
     _guard: RawGuard,
     out: io::Stdout,
