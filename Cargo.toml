@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "app/src-tauri"]
+
+[workspace.dependencies]
+flate2 = "1"
+crossbeam-channel = "0.5"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
