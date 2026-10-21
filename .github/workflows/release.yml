@@ -1,0 +1,223 @@
+name: Release
+
+# 多平台构建发布：tag 触发（v0.1.0 等）
+# 产物：
+#   CLI/TUI 二进制  → rosezip-<os>-<arch>.zip
+#   GUI 桌面包      → Linux deb/AppImage, Windows msi/nsis, macOS dmg
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # Release 上传需要
+
+env:
+  APP_VERSION: "0.1.0"
+
+jobs:
+  # -----------------------------------------------------------------
+  # CLI + TUI 纯二进制（无 GUI 依赖，全平台交叉）
+  # -----------------------------------------------------------------
+  cli:
+    name: CLI ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            artifact: rosezip-linux-x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: rosezip-windows-x86_64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: rosezip-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: rosezip-macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }} -p rosezip-cli
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact }}.tar.gz rosezip
+          cd ../../..
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/rosezip.exe `
+            -DestinationPath ${{ matrix.artifact }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  # -----------------------------------------------------------------
+  # Tauri GUI 桌面安装包
+  # -----------------------------------------------------------------
+  gui:
+    name: GUI ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux
+          - os: windows-latest
+            label: windows
+          - os: macos-14
+            label: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps (webkit2gtk)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui-${{ matrix.os }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1) 先构建前端 → app/dist（custom-protocol 编译期内嵌）
+      - name: Build frontend
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+
+      # 2) tauri-cli 打包（自动跑 beforeBuildCommand 并生成安装包）
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Bundle Linux (deb + AppImage)
+        if: runner.os == 'Linux'
+        working-directory: app
+        run: cargo tauri build --bundles deb,appimage
+
+      - name: Bundle Windows (msi + nsis)
+        if: runner.os == 'Windows'
+        working-directory: app
+        run: cargo tauri build --bundles msi,nsis
+
+      - name: Bundle macOS (dmg + app)
+        if: runner.os == 'macOS'
+        working-directory: app
+        run: cargo tauri build --bundles dmg,app
+
+      - name: Collect artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist-out
+          find . -path ./node_modules -prune -o -name "*.deb" -print -o -name "*.AppImage" -print | grep bundle | while read f; do cp "$f" dist-out/; done
+          ls -la dist-out
+
+      - name: Collect artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-out | Out-Null
+          Get-ChildItem . -Recurse -Directory -Filter bundle |
+            Where-Object { $_.FullName -match 'release[\\/]bundle' } |
+            ForEach-Object { Get-ChildItem $_.FullName -Recurse -Include *.msi,*.exe -File } |
+            Copy-Item -Destination dist-out
+          Get-ChildItem dist-out
+
+      - name: Collect artifacts (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist-out
+          find . -path ./node_modules -prune -o -name "*.dmg" -print | grep bundle | while read f; do cp "$f" dist-out/; done
+          ls -la dist-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rosezip-gui-${{ matrix.label }}
+          path: dist-out/*
+          if-no-files-found: error
+
+  # -----------------------------------------------------------------
+  # 发布：收集所有产物 → GitHub Release
+  # -----------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [cli, gui]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Rename GUI bundles with platform tags
+        run: |
+          cd artifacts
+          for f in *.deb; do [ -e "$f" ] && mv "$f" "rosezip-gui-linux-amd64.deb" || true; done
+          for f in *.AppImage; do [ -e "$f" ] && mv "$f" "rosezip-gui-linux-x86_64.AppImage" || true; done
+          for f in *.msi; do [ -e "$f" ] && mv "$f" "rosezip-gui-windows-x86_64.msi" || true; done
+          for f in *-setup.exe; do [ -e "$f" ] && mv "$f" "rosezip-gui-windows-x86_64-setup.exe" || true; done
+          for f in *.dmg; do [ -e "$f" ] && mv "$f" "rosezip-gui-macos-aarch64.dmg" || true; done
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RoseZIP ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            ## RoseZIP ${{ github.ref_name }}
+
+            ### 下载
+            | 产物 | 平台 | 说明 |
+            |---|---|---|
+            | `rosezip-linux-x86_64.tar.gz` | Linux x64 | CLI + TUI 二进制 |
+            | `rosezip-windows-x86_64.zip` | Windows x64 | CLI + TUI（rosezip.exe） |
+            | `rosezip-macos-x86_64.tar.gz` | macOS Intel | CLI + TUI 二进制 |
+            | `rosezip-macos-aarch64.tar.gz` | macOS Apple Silicon | CLI + TUI 二进制 |
+            | `rosezip-gui-linux-amd64.deb` | Linux x64 | GUI 安装包（deb） |
+            | `rosezip-gui-linux-x86_64.AppImage` | Linux x64 | GUI 便携版 |
+            | `rosezip-gui-windows-x86_64.msi` | Windows x64 | GUI 安装包 |
+            | `rosezip-gui-windows-x86_64-setup.exe` | Windows x64 | GUI 安装向导 |
+            | `rosezip-gui-macos-aarch64.dmg` | macOS Apple Silicon | GUI 磁盘映像 |
+
+            ### CLI / TUI 使用
+            解压后直接运行 `rosezip`：无参数进入 TUI，带子命令走 CLI
+            （`rosezip list/archive.zip`、`rosezip extract -p 密码 …`、`rosezip crack …`）。
+
+            > 密码找回功能仅限用于恢复**自己拥有合法权利**的文件。
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: artifacts/*
