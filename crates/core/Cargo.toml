@@ -3,7 +3,7 @@ name = "rosezip-core"
 version = "0.1.0"
 edition = "2021"
 description = "Archive engine: ZIP/7z handling and password recovery"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 flate2 = { workspace = true }
