@@ -165,13 +165,6 @@ export function Icon({ name, size = 18, strokeWidth = 1.7, className = "", ...re
 export function RoseMark({ size = 26 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 48 48" fill="none" aria-hidden="true">
-      <defs>
-        <linearGradient id="rose-mark-grad" x1="8" y1="4" x2="42" y2="46" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#fb7185" />
-          <stop offset="0.5" stopColor="#e879f9" />
-          <stop offset="1" stopColor="#a78bfa" />
-        </linearGradient>
-      </defs>
       {[0, 60, 120, 180, 240, 300].map((angle) => (
         <ellipse
           key={angle}
@@ -179,12 +172,12 @@ export function RoseMark({ size = 26 }) {
           cy="14.5"
           rx="6.2"
           ry="9.6"
-          fill="url(#rose-mark-grad)"
-          opacity="0.52"
+          fill="var(--accent, #d566e8)"
+          opacity="0.3"
           transform={`rotate(${angle} 24 24)`}
         />
       ))}
-      <circle cx="24" cy="24" r="7.4" fill="url(#rose-mark-grad)" />
+      <circle cx="24" cy="24" r="7.4" fill="var(--accent, #d566e8)" />
       <circle cx="24" cy="24" r="3.2" fill="#140f1e" opacity="0.4" />
     </svg>
   );
