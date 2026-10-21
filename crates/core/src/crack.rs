@@ -497,7 +497,7 @@ fn load_dictionary(path: &Path) -> io::Result<&'static [u8]> {
     }
     #[cfg(not(unix))]
     {
-        Box::leak(fs::read(path)?.into_boxed_slice())
+        Ok(Box::leak(fs::read(path)?.into_boxed_slice()))
     }
 }
 
