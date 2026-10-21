@@ -1,8 +1,10 @@
 // Thin wrappers around Tauri IPC + native dialogs.
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
 export { invoke };
+export { getCurrentWebview };
 
 const ARCHIVE_EXTS = ["zip", "7z", "tar", "gz", "tgz", "xz", "bz2"];
 

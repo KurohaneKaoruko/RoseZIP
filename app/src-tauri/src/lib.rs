@@ -19,6 +19,7 @@ pub struct EntryDto {
     is_dir: bool,
     compressed_size: u64,
     uncompressed_size: u64,
+    mtime: u64,
 }
 
 #[derive(Serialize)]
@@ -85,8 +86,20 @@ impl JobSlot {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-fn inspect_archive(path: String) -> Result<InspectDto, String> {
-    let view = ops::inspect(&PathBuf::from(&path)).map_err(|e| e.to_string())?;
+fn inspect_archive(path: String, password: Option<String>) -> Result<InspectDto, String> {
+    let p = PathBuf::from(&path);
+    // 7z with encrypted headers: unlock listing with the password when given.
+    let view = if rosezip_core::archive::detect_format(&p).map_err(|e| e.to_string())?
+        == rosezip_core::archive::Format::SevenZ
+        && rosezip_core::archive::sevenz_header_encrypted(&p)
+    {
+        let pw = password.filter(|s| !s.is_empty());
+        let entries = rosezip_core::archive::sevenz_entries(&p, pw.as_deref().map(|s| s.as_bytes()))
+            .map_err(|_| "7z 密码错误（无法解密文件头）".to_string())?;
+        crate::view_from_sevenz(&p, entries)?
+    } else {
+        ops::inspect(&p).map_err(|e| e.to_string())?
+    };
     Ok(InspectDto {
         path: view.path.display().to_string(),
         format: format!("{:?}", view.format),
@@ -100,9 +113,74 @@ fn inspect_archive(path: String) -> Result<InspectDto, String> {
                 is_dir: e.is_dir,
                 compressed_size: e.compressed_size,
                 uncompressed_size: e.uncompressed_size,
+                mtime: e.mtime,
             })
             .collect(),
     })
+}
+
+/// Build an ArchiveView from raw 7z entry tuples (used by encrypted-header unlock).
+fn view_from_sevenz(
+    p: &std::path::Path,
+    entries: Vec<(String, bool, bool, u64, u64)>,
+) -> Result<ops::ArchiveView, String> {
+    Ok(ops::ArchiveView {
+        path: p.to_path_buf(),
+        format: rosezip_core::archive::Format::SevenZ,
+        entries: entries
+            .into_iter()
+            .map(|(name, is_dir, encrypted, _packed, size)| ops::EntryView {
+                name,
+                encrypted: encrypted && !is_dir,
+                is_dir,
+                compressed_size: 0,
+                uncompressed_size: size,
+                mtime: 0,
+            })
+            .collect(),
+        encryption: Some("7z AES-256 (encrypted header)".into()),
+    })
+}
+
+/// Extract only the selected entries.
+#[tauri::command]
+fn extract_selected(
+    path: String,
+    names: Vec<String>,
+    dest: String,
+    password: Option<String>,
+) -> Result<ReportDto, String> {
+    let pw = password.filter(|s| !s.is_empty());
+    let pw_bytes = pw.as_deref().map(|s| s.as_bytes());
+    match ops::extract_entries(&PathBuf::from(&path), &names, &PathBuf::from(&dest), pw_bytes) {
+        Ok(r) => Ok(ReportDto {
+            ok: r.errors.is_empty(),
+            message: format!("已解压 {} 个文件到 {}", r.files, dest),
+            errors: r.errors,
+        }),
+        Err(e) => Ok(ReportDto { ok: false, message: e.to_string(), errors: vec![] }),
+    }
+}
+
+/// Test archive integrity (7-Zip style "Test" command).
+#[tauri::command]
+fn test_archive_cmd(path: String, password: Option<String>) -> Result<ReportDto, String> {
+    let pw = password.filter(|s| !s.is_empty());
+    let pw_bytes = pw.as_deref().map(|s| s.as_bytes());
+    match ops::test_archive(&PathBuf::from(&path), pw_bytes) {
+        Ok(r) => {
+            if r.errors.is_empty() {
+                Ok(ReportDto {
+                    ok: true,
+                    message: format!("测试通过：{} 个条目校验成功", r.files),
+                    errors: vec![],
+                })
+            } else {
+                Ok(ReportDto { ok: false, message: "测试失败".into(), errors: r.errors })
+            }
+        }
+        Err(e) => Ok(ReportDto { ok: false, message: e.to_string(), errors: vec![] }),
+    }
 }
 
 #[tauri::command]
@@ -151,6 +229,7 @@ fn bench_speed() -> Result<BenchDto, String> {
         crc32: 0x11223344,
         is_dir: false,
         dos_time: 0x98b,
+        dos_date: 0x5B99,
     };
     let verifier = Arc::new(
         Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x98b))
@@ -383,7 +462,9 @@ pub fn run() {
             crack_status,
             crack_cancel,
             startup_path,
-            app_version
+            app_version,
+            extract_selected,
+            test_archive_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

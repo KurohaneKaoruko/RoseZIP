@@ -584,6 +584,7 @@ mod job_tests {
             crc32: 0x11223344,
             is_dir: false,
             dos_time: 0x098b,
+            dos_date: 0x5B99,
         };
         let v = std::sync::Arc::new(
             Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x098b)).unwrap(),

@@ -848,6 +848,7 @@ mod tests {
             crc32: 0x8dd59d0b,
             is_dir: false,
             dos_time: 0x098b,
+            dos_date: 0x5B99,
         };
         // 12 bytes captured from an Info-ZIP archive with password "ab"
         let data: [u8; 16] = [

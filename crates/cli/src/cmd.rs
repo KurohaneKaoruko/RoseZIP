@@ -23,6 +23,24 @@ pub fn dispatch(cmd: Cmd) -> io::Result<String> {
         Cmd::Crack { file, charset, min_len, max_len, dictionary, threads, quiet } => {
             cmd_crack(&file, &charset, min_len, max_len, dictionary.as_deref(), threads, quiet)
         }
+        Cmd::Test { file, password } => cmd_test(&file, password.as_deref()),
+    }
+}
+
+fn cmd_test(path: &Path, password: Option<&str>) -> io::Result<String> {
+    let report = ops::test_archive(path, password.map(|s| s.as_bytes()))?;
+    if report.errors.is_empty() {
+        Ok(format!(
+            "test ok: {} entries verified, no errors\nchecksums match — archive is healthy",
+            if report.files == 0 { "all".to_string() } else { report.files.to_string() }
+        ))
+    } else {
+        let mut out = format!("test FAILED: {} problem(s)\n", report.errors.len());
+        for e in &report.errors {
+            out.push_str(&format!("  {}\n", e));
+        }
+        // A failed integrity test is an error for scripts/CI.
+        return Err(io::Error::new(io::ErrorKind::InvalidData, out));
     }
 }
 
@@ -96,6 +114,7 @@ fn cmd_bench() -> io::Result<String> {
         crc32: 0x11223344,
         is_dir: false,
         dos_time: 0x98b,
+        dos_date: 0x5B99,
     };
     let verifier = std::sync::Arc::new(
         rosezip_core::zipcrypt::Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x98b))

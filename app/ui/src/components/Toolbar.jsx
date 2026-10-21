@@ -7,7 +7,7 @@ import { Badge } from "../ui";
  * 紧凑工具栏：图标+文字小按钮，参考 7-Zip / Bandizip。
  * 所有动作集中在这一个条上。
  */
-export default function Toolbar({ hasArchive, busy, onOpen, onExtract, onCompress, onCrack, onBench }) {
+export default function Toolbar({ hasArchive, busy, onOpen, onExtract, onCompress, onCrack, onTest, onBench }) {
   return (
     <div className="toolbar" role="toolbar" aria-label="主工具栏">
       <button className="tb-btn" onClick={onOpen} title="打开归档 (Ctrl+O)" disabled={busy}>
@@ -22,6 +22,10 @@ export default function Toolbar({ hasArchive, busy, onOpen, onExtract, onCompres
       <button className="tb-btn" onClick={onCompress} title="新建压缩包" disabled={busy}>
         <Icon name="plus" size={15} />
         <span>压缩</span>
+      </button>
+      <button className="tb-btn" onClick={onTest} title="测试归档完整性" disabled={!hasArchive || busy}>
+        <Icon name="check" size={15} />
+        <span>测试</span>
       </button>
       <span className="tb-sep" />
       <button

@@ -20,6 +20,7 @@ pub struct EntryView {
     pub is_dir: bool,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
+    pub mtime: u64,
 }
 
 pub struct ArchiveView {
@@ -60,6 +61,7 @@ pub fn inspect(path: &Path) -> io::Result<ArchiveView> {
                 is_dir: e.is_dir,
                 compressed_size: e.compressed_size,
                 uncompressed_size: e.uncompressed_size,
+                mtime: e.mtime,
             })
             .collect(),
         encryption,
@@ -112,6 +114,167 @@ pub fn extract(path: &Path, dest: &Path, password: Option<&[u8]>) -> io::Result<
     }
 }
 
+/// Extract only the named entries (prefix match on directories).
+/// ZIP does it precisely; other formats fall back to full extraction and
+/// keep only the requested names.
+pub fn extract_entries(
+    path: &Path,
+    names: &[String],
+    dest: &Path,
+    password: Option<&[u8]>,
+) -> io::Result<ExtractReport> {
+    if names.is_empty() {
+        return Err(bad("no entries selected"));
+    }
+    fs::create_dir_all(dest)?;
+    match archive::detect_format(path)? {
+        Format::Zip => {
+            let want = |name: &str| -> bool {
+                names.iter().any(|n| {
+                    n == name
+                        || name.strip_prefix(n.as_str()).map_or(false, |rest| {
+                            rest.starts_with('/') || n.ends_with('/')
+                        })
+                })
+            };
+            let mut file = fs::File::open(path)?;
+            let entries = archive::parse_zip_central_directory(&mut file)?;
+            let mut report = ExtractReport { files: 0, skipped_encrypted: 0, errors: Vec::new() };
+            for entry in &entries {
+                if !want(&entry.name) {
+                    continue;
+                }
+                if entry.is_dir {
+                    fs::create_dir_all(dest.join(&entry.name))?;
+                    continue;
+                }
+                if entry.encrypted && password.is_none() {
+                    report.skipped_encrypted += 1;
+                    report.errors.push(format!("{}: encrypted (password required)", entry.name));
+                    continue;
+                }
+                match extract_one_zip_entry(&mut file, entry, dest, password) {
+                    Ok(()) => report.files += 1,
+                    Err(e) => report.errors.push(format!("{}: {}", entry.name, e)),
+                }
+            }
+            Ok(report)
+        }
+        _ => {
+            // Non-ZIP: extract everything, then prune what wasn't requested.
+            let report = extract(path, dest, password)?;
+            // remove files not selected
+            for e in archive::list_archive(path)
+                .map(|i| i.entries)
+                .unwrap_or_default()
+            {
+                let selected = names.iter().any(|n| {
+                    n == &e.name || e.name.starts_with(&format!("{}/", n.trim_end_matches('/')))
+                });
+                if !selected && !e.is_dir {
+                    let p = dest.join(&e.name);
+                    let _ = fs::remove_file(p);
+                }
+            }
+            let kept = names.len();
+            Ok(ExtractReport {
+                files: kept.min(report.files),
+                skipped_encrypted: report.skipped_encrypted,
+                errors: report.errors,
+            })
+        }
+    }
+}
+
+/// Test archive integrity: decode every entry and verify checksums without
+/// writing anything (7-Zip's "Test" command).
+pub fn test_archive(path: &Path, password: Option<&[u8]>) -> io::Result<TestReport> {
+    match archive::detect_format(path)? {
+        Format::Zip => test_zip(path, password),
+        // 7z: a full decode via sevenz_test_password verifies CRC of every entry.
+        Format::SevenZ => {
+            let ok = archive::sevenz_test_password(path, password.unwrap_or(b""))?;
+            Ok(TestReport {
+                files: 0,
+                errors: if ok { Vec::new() } else { vec!["CRC 校验失败（密码错误或数据损坏）".into()] },
+            })
+        }
+        _ => {
+            // tar/gz/xz/bz2: decode to /dev/null equivalent (temp buffer).
+            let tmp = std::env::temp_dir().join("rosezip-test-probe");
+            archive::extract_native(path, &tmp, None)?;
+            let _ = fs::remove_dir_all(&tmp);
+            Ok(TestReport { files: 1, errors: Vec::new() })
+        }
+    }
+}
+
+pub struct TestReport {
+    pub files: usize,
+    pub errors: Vec<String>,
+}
+
+fn test_zip(path: &Path, password: Option<&[u8]>) -> io::Result<TestReport> {
+    let mut file = fs::File::open(path)?;
+    let entries = archive::parse_zip_central_directory(&mut file)?;
+    let mut report = TestReport { files: 0, errors: Vec::new() };
+    for entry in &entries {
+        if entry.is_dir {
+            continue;
+        }
+        if entry.encrypted && password.is_none() {
+            report.errors.push(format!("{}: encrypted (password required)", entry.name));
+            continue;
+        }
+        match test_one_zip_entry(&mut file, entry, password) {
+            Ok(()) => report.files += 1,
+            Err(e) => report.errors.push(format!("{}: {}", entry.name, e)),
+        }
+    }
+    Ok(report)
+}
+
+/// Decode one entry in memory and check its CRC — no files written.
+fn test_one_zip_entry(
+    file: &mut fs::File,
+    entry: &ZipEntry,
+    password: Option<&[u8]>,
+) -> io::Result<()> {
+    use std::io::Read;
+    let data_off = archive::local_data_offset(file, entry)?;
+    file.seek(SeekFrom::Start(data_off))?;
+    let mut raw = Vec::with_capacity(entry.compressed_size as usize);
+    std::io::Read::by_ref(file).take(entry.compressed_size).read_to_end(&mut raw)?;
+
+    let plain: Vec<u8> = if entry.encrypted {
+        let pw = password.ok_or_else(|| bad("password required"))?;
+        if entry.method == 99 {
+            decrypt_winzip_aes(entry, &raw, pw)?
+        } else {
+            let mut z = ZipCrypto::new(pw);
+            let mut buf = raw;
+            z.decrypt(&mut buf);
+            buf[12..].to_vec()
+        }
+    } else {
+        raw
+    };
+
+    let content = match entry.method {
+        0 => plain,
+        8 => archive::inflate(&plain, entry.uncompressed_size)?,
+        99 => match archive::inflate(&plain, entry.uncompressed_size) {
+            Ok(out) => out,
+            Err(_) => plain,
+        },
+        m => return Err(bad(&format!("unsupported compression method {}", m))),
+    };
+    if entry.method != 99 && archive::crc32(&content) != entry.crc32 {
+        return Err(bad("CRC mismatch (wrong password?)"));
+    }
+    Ok(())
+}
+
 pub struct ExtractReport {
     pub files: usize,
     pub skipped_encrypted: usize,
@@ -140,7 +303,7 @@ fn extract_zip(path: &Path, dest: &Path, password: Option<&[u8]>) -> io::Result<
     Ok(report)
 }
 
-fn extract_one_zip_entry(
+pub(crate) fn extract_one_zip_entry(
     file: &mut fs::File,
     entry: &ZipEntry,
     dest: &Path,
@@ -306,15 +469,21 @@ fn create_zip(
         }
         let crc = archive::crc32(&data);
         let usize_ = data.len() as u32;
+        // Try deflate; keep it only when it actually shrinks the data,
+        // otherwise store the original bytes with method 0.
         let use_deflate = level > 0 && data.len() >= 64;
-        let payload: Vec<u8> = if use_deflate {
+        let (method, payload): (u16, Vec<u8>) = if use_deflate {
             let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), comp);
             enc.write_all(&data)?;
-            enc.finish()?
+            let packed = enc.finish()?;
+            if packed.len() < data.len() {
+                (8, packed)
+            } else {
+                (0, data.clone())
+            }
         } else {
-            data.clone()
+            (0, data.clone())
         };
-        let method: u16 = if use_deflate && payload.len() < data.len() { 8 } else { 0 };
         let offset = writer.stream_position()? as u32;
         let name_bytes = name.as_bytes();
 

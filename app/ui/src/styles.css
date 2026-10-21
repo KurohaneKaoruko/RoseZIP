@@ -151,8 +151,51 @@ body {
 .fl-lock { color: var(--amber); }
 .fl-dash { color: var(--text-3); }
 .fl-col-name { overflow-wrap: anywhere; }
-.fl-col-size, .fl-col-packed { width: 110px; }
-.fl-col-enc { width: 60px; }
+.fl-col-size, .fl-col-packed { width: 96px; }
+.fl-col-time { width: 132px; }
+.fl-col-enc { width: 52px; }
+.fl-table tbody tr { cursor: default; user-select: none; }
+.fl-table tbody tr.fl-selected td {
+  background: rgba(232, 121, 249, 0.13);
+}
+.fl-table tbody tr.fl-selected td:first-child {
+  box-shadow: inset 2.5px 0 0 var(--fuchsia);
+}
+.fl-k-arch { color: var(--violet); }
+.fl-k-txt { color: var(--text-2); }
+.fl-k-img { color: #67e8f9; }
+.fl-k-audio { color: var(--green); }
+.fl-k-vid { color: var(--rose); }
+.fl-k-bin { color: var(--amber); }
+.fl-crumbs { display: inline-flex; align-items: center; gap: 2px; min-width: 0; max-width: 480px; overflow: hidden; }
+.crumb {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: none; border: none; padding: 2px 6px; border-radius: 6px;
+  color: var(--text-2); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.crumb:hover { background: rgba(255,255,255,.07); color: var(--text); }
+.crumb-sep { color: var(--text-3); }
+.fl-cwd-hint { display: inline-flex; align-items: center; gap: 5px; color: var(--text-3); font-size: 12px; }
+.unlock-row { display: flex; gap: 8px; margin-top: 10px; }
+.unlock-row .input { width: 240px; }
+.sel-hint { color: var(--text-2); font-size: 12.5px; }
+.sel-hint b { color: var(--fuchsia); }
+
+/* 拖拽遮罩 */
+.drag-overlay {
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(12, 8, 20, 0.72); backdrop-filter: blur(2px);
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+.drag-card {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  padding: 34px 56px;
+  border: 2px dashed rgba(232, 121, 249, 0.55); border-radius: 18px;
+  background: rgba(30, 24, 48, 0.85);
+  color: var(--text); font-size: 15px; font-weight: 600;
+}
+.app-shell.drag-over::after { content: none; }
 
 .fl-status {
   flex: 1; display: flex; flex-direction: column;

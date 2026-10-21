@@ -70,6 +70,8 @@ pub struct ZipEntry {
     pub is_dir: bool,
     /// DOS mod-time, used as an alternative ZipCrypto check byte
     pub dos_time: u16,
+    /// DOS mod-date (date half of the same timestamp)
+    pub dos_date: u16,
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -122,6 +124,7 @@ pub fn parse_zip_central_directory(file: &mut fs::File) -> io::Result<Vec<ZipEnt
         let flags = rd16(&cd, off + 8);
         let method = rd16(&cd, off + 10);
         let dos_time = rd16(&cd, off + 12);
+        let dos_date = rd16(&cd, off + 14);
         let crc32 = rd32(&cd, off + 16);
         let csize = rd32(&cd, off + 20) as u64;
         let usize_ = rd32(&cd, off + 24) as u64;
@@ -140,6 +143,7 @@ pub fn parse_zip_central_directory(file: &mut fs::File) -> io::Result<Vec<ZipEnt
             method,
             crc32,
             dos_time,
+            dos_date,
         });
         off += 46 + name_len + extra_len + comment_len;
     }
@@ -214,7 +218,7 @@ fn sevenz_map_err(e: sevenz_rust::Error) -> io::Error {
     }
 }
 
-fn sevenz_entries(path: &Path, pw: Option<&[u8]>) -> io::Result<Vec<(String, bool, bool, u64, u64)>> {
+pub fn sevenz_entries(path: &Path, pw: Option<&[u8]>) -> io::Result<Vec<(String, bool, bool, u64, u64)>> {
     let ar = sevenz_rust::SevenZReader::open(path, sevenz_password(pw))
         .map_err(|_| bad("cannot read archive (encrypted header? supply password)"))?;
     Ok(ar
@@ -292,6 +296,8 @@ pub struct EntryInfo {
     pub is_dir: bool,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
+    /// Unix mtime (seconds); 0 = unknown.
+    pub mtime: u64,
 }
 
 pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
@@ -301,12 +307,17 @@ pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
             let mut file = fs::File::open(path)?;
             parse_zip_central_directory(&mut file)?
                 .into_iter()
-                .map(|e| EntryInfo {
-                    name: e.name,
-                    encrypted: e.encrypted && !e.is_dir,
-                    is_dir: e.is_dir,
-                    compressed_size: e.compressed_size,
-                    uncompressed_size: e.uncompressed_size,
+                .map(|e| {
+                    // DOS 时间 → 简单 UTC 时间戳
+                    let mtime = dos_datetime_to_unix(e.dos_date, e.dos_time);
+                    EntryInfo {
+                        name: e.name,
+                        encrypted: e.encrypted && !e.is_dir,
+                        is_dir: e.is_dir,
+                        compressed_size: e.compressed_size,
+                        uncompressed_size: e.uncompressed_size,
+                        mtime,
+                    }
                 })
                 .collect()
         }
@@ -318,6 +329,7 @@ pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
                 is_dir,
                 compressed_size: 0,
                 uncompressed_size: size,
+                mtime: 0,
             })
             .collect(),
         Format::Tar => {
@@ -332,6 +344,7 @@ pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
                     is_dir: header.entry_type().is_dir(),
                     compressed_size: 0,
                     uncompressed_size: header.size().unwrap_or(0),
+                    mtime: header.mtime().unwrap_or(0),
                 });
             }
             list
@@ -344,6 +357,7 @@ pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
                 is_dir: false,
                 compressed_size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
                 uncompressed_size: 0,
+                mtime: 0,
             }]
         }
         Format::Xz | Format::Bz2 => {
@@ -359,12 +373,43 @@ pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
                 is_dir: false,
                 compressed_size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
                 uncompressed_size: 0,
+                mtime: 0,
             }]
         }
     };
     Ok(ArchiveInfo { path: path.to_path_buf(), format, entries })
 }
 
+/// DOS date + time (as stored in ZIP records) → Unix seconds (UTC).
+pub fn dos_datetime_to_unix(dos_date: u16, dos_time: u16) -> u64 {
+    let year = ((dos_date >> 9) & 0x7f) as u64 + 1980;
+    let month = ((dos_date >> 5) & 0x0f) as u64;
+    let day = (dos_date & 0x1f) as u64;
+    let hour = ((dos_time >> 11) & 0x1f) as u64;
+    let minute = ((dos_time >> 5) & 0x3f) as u64;
+    let second = (dos_time & 0x1f) as u64 * 2;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return 0;
+    }
+    // days since epoch for the first of the month, then add day-1
+    const CUM: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut days = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100
+        + (year - 1601) / 400;
+    days += CUM[(month - 1) as usize] + day - 1;
+    // leap day already passed this year?
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if leap && month > 2 {
+        days += 1;
+    }
+    days * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// DOS time field alone (no date) — never valid for display; kept only for
+/// source compatibility with the ZipCrypto check-byte path.
+pub fn dos_to_unix(dos_time: u16) -> u64 {
+    let _ = dos_time;
+    0
+}
 // ---------------------------------------------------------------------------
 // Native extraction for every format
 // ---------------------------------------------------------------------------
