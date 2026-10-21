@@ -1,4 +1,6 @@
 //! RoseZIP Tauri backend: exposes the engine as IPC commands.
+//!
+//! SPDX-License-Identifier: GPL-3.0-only
 
 use std::path::PathBuf;
 use std::sync::Arc;

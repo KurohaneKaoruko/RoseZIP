@@ -1,6 +1,8 @@
 //! RoseZIP CLI.
 //!
 //! No arguments → interactive TUI. Arguments → direct execution.
+//!
+//! SPDX-License-Identifier: GPL-3.0-only
 
 mod cmd;
 mod tui;
