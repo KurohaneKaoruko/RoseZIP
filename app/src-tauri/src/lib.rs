@@ -205,11 +205,27 @@ fn compress_archive(
     out: String,
     password: Option<String>,
     level: Option<u32>,
+    format: Option<String>,
 ) -> Result<ReportDto, String> {
     let inputs: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
     let pw = password.filter(|s| !s.is_empty());
     let pw_bytes = pw.as_deref().map(|s| s.as_bytes());
-    match ops::compress(&inputs, &PathBuf::from(&out), pw_bytes, level.unwrap_or(6)) {
+    let fmt = match format.as_deref() {
+        None | Some("") | Some("auto") => None,
+        Some(s) => Some(match s {
+            "zip" => ops::OutFormat::Zip,
+            "7z" => ops::OutFormat::SevenZ,
+            "tar" => ops::OutFormat::Tar,
+            "tar.gz" => ops::OutFormat::TarGz,
+            "tar.xz" => ops::OutFormat::TarXz,
+            "tar.bz2" => ops::OutFormat::TarBz2,
+            "gz" => ops::OutFormat::Gz,
+            "xz" => ops::OutFormat::Xz,
+            "bz2" => ops::OutFormat::Bz2,
+            other => return Err(format!("未知格式: {}", other)),
+        }),
+    };
+    match ops::compress_as(&inputs, &PathBuf::from(&out), pw_bytes, level.unwrap_or(6), fmt) {
         Ok(r) => Ok(ReportDto {
             ok: true,
             message: format!("已添加 {} 个文件（{} 字节）→ {}", r.files, r.bytes, out),
@@ -217,6 +233,45 @@ fn compress_archive(
         }),
         Err(e) => Ok(ReportDto { ok: false, message: e.to_string(), errors: vec![] }),
     }
+}
+
+#[tauri::command]
+fn delete_entries_cmd(
+    path: String,
+    entries: Vec<String>,
+    password: Option<String>,
+) -> Result<ReportDto, String> {
+    let n = ops::delete_entries(
+        &PathBuf::from(&path),
+        &entries,
+        password.as_deref().map(|s| s.as_bytes()),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ReportDto {
+        ok: true,
+        message: format!("已删除 {} 个条目", n),
+        errors: vec![],
+    })
+}
+
+#[tauri::command]
+fn rename_entry_cmd(
+    path: String,
+    old_name: String,
+    new_name: String,
+    password: Option<String>,
+) -> Result<ReportDto, String> {
+    let n = ops::rename_entries(
+        &PathBuf::from(&path),
+        &[(old_name, new_name)],
+        password.as_deref().map(|s| s.as_bytes()),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ReportDto {
+        ok: true,
+        message: format!("已重命名 {} 个条目", n),
+        errors: vec![],
+    })
 }
 
 #[tauri::command]
@@ -466,7 +521,9 @@ pub fn run() {
             startup_path,
             app_version,
             extract_selected,
-            test_archive_cmd
+            test_archive_cmd,
+            delete_entries_cmd,
+            rename_entry_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,12 +6,18 @@
 ## 功能
 
 - **全格式原生支持（零外部依赖，不调用任何系统命令）**：
-  - **ZIP**：自研解析器 + flate2 解压/压缩，含 ZipCrypto 加密写出
-  - **7z**：`sevenz-rust` 纯 Rust 解码（LZMA/LZMA2 + AES-256-SHA-256），支持加密头（`-mhe=on`）
-  - **tar / gz / xz / bz2**：`tar` / `flate2` / `liblzma`(静态内嵌) / `bzip2`
+  - **ZIP**：自研解析器 + flate2 解压/压缩，含 ZipCrypto 加密写出、UTF-8 文件名（EFS）、空目录保留
+  - **7z**：`sevenz-rust` 纯 Rust 解码与**编码**（LZMA/LZMA2 + AES-256-SHA-256），支持加密头（`-mhe=on`）
+  - **tar / tar.gz / tar.xz / tar.bz2 / gz / xz / bz2**：完整读+写，`.tar.*` 按整体归档列出与解包
 - **加密 ZIP 全支持**：
   - ZipCrypto（传统加密）—— 原生完整支持解压、加密压缩与爆破
   - WinZip AES（AE-1/AE-2，AES-128/192/256）—— 原生完整支持解压与爆破
+- **归档编辑**（就地改写，无需解压再打包）：
+  - 删除条目（ZIP 原始字节复制，不重压缩；7z/tar 同格式重建）
+  - 重命名条目 / 目录（支持中文等 UTF-8 名称）
+  - CLI：`rosezip delete`、`rosezip rename OLD=NEW`
+  - GUI：右键条目 → 解压所选 / 复制路径 / 重命名 / 删除
+- **时间戳保留**：解压 ZIP 时恢复修改时间（DOS 时间）
 - **多线程密码爆破**：暴力破解（可配置字符集与长度）+ 字典攻击
 - **7z 密码攻击**：进程内逐候选解码验证（~30ms/次），无需系统 7z
 - **性能**：4 线程下 ZipCrypto 约 **17–20M 密码/秒**（见下方数据）
@@ -58,6 +64,16 @@ rosezip extract archive.zip -o out_dir -p 密码
 # 创建 ZIP（level 0-9）
 rosezip compress 文件或目录 -o out.zip
 rosezip compress dir -o enc.zip -p 密码     # 原生 ZipCrypto 加密，unzip/7z 均可解
+
+# 其他格式（-F 或按 -o 扩展名自动推断）
+rosezip compress dir -o out.7z -p 密码      # 7z LZMA2 + AES-256 + 加密头
+rosezip compress dir -o out.tar.gz          # tar.gz / tar.xz / tar.bz2 / tar 同理
+rosezip compress big.bin -F xz -o big.xz    # 单流压缩
+
+# 归档编辑（就地改写）
+rosezip delete archive.zip dir/             # 删除整个目录（含条目）
+rosezip delete archive.zip a.txt b.txt
+rosezip rename archive.zip 旧名.txt=新名.txt
 
 # 爆破 ZipCrypto：小写+数字，1~6 位
 rosezip crack archive.zip -c lower+digits -n 1 -x 6

@@ -2880,6 +2880,7 @@ version = "0.1.0"
 dependencies = [
  "bzip2",
  "crossbeam-channel",
+ "filetime",
  "flate2",
  "liblzma",
  "sevenz-rust",

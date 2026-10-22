@@ -26,7 +26,7 @@ function fileKind(name) {
  * 主体文件列表：名称 / 大小 / 压缩后 / 修改时间 / 加密。
  * 支持多选（Ctrl/Shift + 点击）、双击目录进入、面包屑返回。
  */
-export default function FileList({ view, loading, selected, onSelected, onUnlockHeader }) {
+export default function FileList({ view, loading, selected, onSelected, onUnlockHeader, onContextAction }) {
   const [query, setQuery] = useState("");
   const [cwd, setCwd] = useState(""); // 当前子目录（'' = 根）
   const [lastIndex, setLastIndex] = useState(-1);
@@ -112,6 +112,12 @@ export default function FileList({ view, loading, selected, onSelected, onUnlock
       onSelected(new Set());
       setQuery("");
     }
+  };
+
+  /** Row name → full archive path (rows inside a folder are relative). */
+  const fullPath = (row) => {
+    if (!cwd || query.trim()) return row.is_dir ? `${row.name}/` : row.name;
+    return `${cwd.replace(/\/$/, "")}/${row.name}`;
   };
 
   if (loading) {
@@ -229,6 +235,14 @@ export default function FileList({ view, loading, selected, onSelected, onUnlock
                     className={isSel ? "fl-selected" : ""}
                     onClick={(ev) => toggle(e.name, ev, i)}
                     onDoubleClick={() => openRow(e)}
+                    onContextMenu={(ev) => {
+                      if (!onContextAction) return;
+                      ev.preventDefault();
+                      // 树视图中行名是相对当前目录的 — 还原为归档内全路径
+                      const full = fullPath(e);
+                      if (!isSel) onSelected(new Set([e.name]));
+                      onContextAction(ev, { ...e, name: full });
+                    }}
                   >
                     <td className="fl-col-name">
                       <span className="fl-name">

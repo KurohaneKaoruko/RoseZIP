@@ -135,6 +135,7 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
   const [out, setOut] = useState("");
   const [password, setPassword] = useState("");
   const [level, setLevel] = useState("6");
+  const [format, setFormat] = useState("auto");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
   const [manual, setManual] = useState("");
@@ -143,6 +144,26 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
   useEffect(() => {
     fileRef.current?.focus();
   }, []);
+
+  const FORMATS = [
+    ["auto", "自动"],
+    ["zip", "ZIP"],
+    ["7z", "7z"],
+    ["tar", "tar"],
+    ["tar.gz", "tar.gz"],
+    ["tar.xz", "tar.xz"],
+    ["tar.bz2", "tar.bz2"],
+    ["gz", "gz"],
+    ["xz", "xz"],
+    ["bz2", "bz2"],
+  ];
+  // Formats whose password field actually encrypts (per current selection).
+  const encNote =
+    format === "7z"
+      ? "留空不加密 · AES-256 + 加密头"
+      : format === "zip" || format === "auto"
+        ? "留空不加密 · ZIP 加密"
+        : "该格式不支持加密";
 
   function addPaths(paths) {
     setFiles((prev) => [...new Set([...prev, ...paths])]);
@@ -158,6 +179,7 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
         out: out.trim(),
         password: password || null,
         level: Number(level),
+        format: format === "auto" ? null : format,
       });
       setResult(r);
       if (r.ok) onDone?.(r);
@@ -276,14 +298,32 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
           </div>
         </label>
         <div className="frow">
+          <span className="frow-label">格式</span>
+          <div className="frow-main row-tight">
+            <select
+              className="input grow"
+              value={format}
+              onChange={(e) => setFormat(e.target.value)}
+              disabled={busy}
+            >
+              {FORMATS.map(([v, l]) => (
+                <option key={v} value={v}>
+                  {l}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className="frow">
           <span className="frow-label">密码</span>
           <input
             className="input frow-main"
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            placeholder="留空不加密 (ZipCrypto)"
+            placeholder={encNote}
             autoComplete="new-password"
+            disabled={busy}
           />
         </div>
         <div className="frow">

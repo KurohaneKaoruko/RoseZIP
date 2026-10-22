@@ -15,8 +15,8 @@ pub fn dispatch(cmd: Cmd) -> io::Result<String> {
             let dest = out_dir.unwrap_or_else(|| PathBuf::from("."));
             cmd_extract(&file, &dest, password.as_deref())
         }
-        Cmd::Compress { files, out, password, level } => {
-            cmd_compress(files, &out, password.as_deref(), level)
+        Cmd::Compress { files, out, password, level, format } => {
+            cmd_compress(files, &out, password.as_deref(), level, format.as_deref())
         }
         Cmd::Check { file } => cmd_check(&file),
         Cmd::Bench => cmd_bench(),
@@ -24,11 +24,34 @@ pub fn dispatch(cmd: Cmd) -> io::Result<String> {
             cmd_crack(&file, &charset, min_len, max_len, dictionary.as_deref(), threads, quiet)
         }
         Cmd::Test { file, password } => cmd_test(&file, password.as_deref()),
+        Cmd::Delete { file, entries, password } => {
+            cmd_delete(&file, &entries, password.as_deref())
+        }
+        Cmd::Rename { file, pairs, password } => cmd_rename(&file, &pairs, password.as_deref()),
     }
 }
 
-fn cmd_test(path: &Path, password: Option<&str>) -> io::Result<String> {
-    let report = ops::test_archive(path, password.map(|s| s.as_bytes()))?;
+fn cmd_delete(file: &Path, entries: &[String], password: Option<&str>) -> io::Result<String> {
+    let n = ops::delete_entries(file, entries, password.map(|s| s.as_bytes()))?;
+    Ok(format!("deleted {} entr{} from {}", n, if n == 1 { "y" } else { "ies" }, file.display()))
+}
+
+fn cmd_rename(file: &Path, pairs: &[String], password: Option<&str>) -> io::Result<String> {
+    let mut renames = Vec::new();
+    for p in pairs {
+        let (old, new) = p.split_once('=').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("rename pair must be OLD=NEW, got '{}'", p),
+            )
+        })?;
+        renames.push((old.to_owned(), new.to_owned()));
+    }
+    let n = ops::rename_entries(file, &renames, password.map(|s| s.as_bytes()))?;
+    Ok(format!("renamed {} entr{} in {}", n, if n == 1 { "y" } else { "ies" }, file.display()))
+}
+
+fn cmd_test(path: &Path, password: Option<&str>) -> io::Result<String> {    let report = ops::test_archive(path, password.map(|s| s.as_bytes()))?;
     if report.errors.is_empty() {
         Ok(format!(
             "test ok: {} entries verified, no errors\nchecksums match — archive is healthy",
@@ -84,8 +107,34 @@ fn cmd_extract(path: &Path, dest: &Path, password: Option<&str>) -> io::Result<S
     Ok(out)
 }
 
-fn cmd_compress(files: Vec<PathBuf>, out: &Path, password: Option<&str>, level: u32) -> io::Result<String> {
-    let report = ops::compress(&files, out, password.map(|s| s.as_bytes()), level)?;
+fn cmd_compress(
+    files: Vec<PathBuf>,
+    out: &Path,
+    password: Option<&str>,
+    level: u32,
+    format: Option<&str>,
+) -> io::Result<String> {
+    let fmt = match format {
+        None => None,
+        Some(s) => Some(match s.to_lowercase().as_str() {
+            "zip" => ops::OutFormat::Zip,
+            "7z" => ops::OutFormat::SevenZ,
+            "tar" => ops::OutFormat::Tar,
+            "tar.gz" | "tgz" => ops::OutFormat::TarGz,
+            "tar.xz" | "txz" => ops::OutFormat::TarXz,
+            "tar.bz2" | "tbz2" => ops::OutFormat::TarBz2,
+            "gz" => ops::OutFormat::Gz,
+            "xz" => ops::OutFormat::Xz,
+            "bz2" => ops::OutFormat::Bz2,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown format '{}' (zip/7z/tar/tar.gz/tar.xz/tar.bz2/gz/xz/bz2)", other),
+                ))
+            }
+        }),
+    };
+    let report = ops::compress_as(&files, out, password.map(|s| s.as_bytes()), level, fmt)?;
     Ok(format!("added {} files, {} -> {}", report.files, human(report.bytes), out.display()))
 }
 
