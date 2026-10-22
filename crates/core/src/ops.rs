@@ -9,6 +9,61 @@ use crate::archive::{self, Format, ZipEntry};
 use crate::charset::{self, IndexGen};
 use crate::zipcrypt::{self, AesStrength, Verifier, ZipCrypto};
 
+/// Central-directory bookkeeping for the native ZIP writer.
+struct CdRecord {
+    name: String,
+    method: u16,
+    crc: u32,
+    csize: u32,
+    usize_: u32,
+    offset: u32,
+    dos_time: u16,
+    dos_date: u16,
+    encrypted: bool,
+}
+
+/// 0x800 when the name needs the UTF-8 (EFS) flag, 0 when pure ASCII.
+fn is_ascii_name(name: &str) -> bool {
+    name.is_ascii()
+}
+
+fn efs_flag(name: &str) -> u16 {
+    if is_ascii_name(name) {
+        0
+    } else {
+        0x800
+    }
+}
+
+/// Append a directory entry (0-byte, method 0) to the archive under build.
+fn write_zip_dir(
+    writer: &mut fs::File,
+    name: &str,
+    dos_time: u16,
+    dos_date: u16,
+    central: &mut Vec<CdRecord>,
+) -> io::Result<()> {
+    let offset = writer.stream_position()? as u32;
+    let mut lfh = [0u8; 30];
+    lfh[..4].copy_from_slice(b"PK\x03\x04");
+    lfh[4..6].copy_from_slice(&20u16.to_le_bytes());
+    lfh[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    writer.write_all(&lfh)?;
+    writer.write_all(name.as_bytes())?;
+    central.push(CdRecord {
+        name: name.to_owned(),
+        method: 0,
+        crc: 0,
+        csize: 0,
+        usize_: 0,
+        offset,
+        dos_time,
+        dos_date,
+        encrypted: false,
+    });
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Info / list
 // ---------------------------------------------------------------------------
@@ -131,10 +186,11 @@ pub fn extract_entries(
         Format::Zip => {
             let want = |name: &str| -> bool {
                 names.iter().any(|n| {
+                    let n = n.trim_end_matches('/');
+                    let name = name.trim_end_matches('/');
                     n == name
-                        || name.strip_prefix(n.as_str()).map_or(false, |rest| {
-                            rest.starts_with('/') || n.ends_with('/')
-                        })
+                        || name.strip_prefix(n).map_or(false, |rest| rest.starts_with('/'))
+                        || n.strip_prefix(name).map_or(false, |rest| rest.starts_with('/'))
                 })
             };
             let mut file = fs::File::open(path)?;
@@ -145,7 +201,7 @@ pub fn extract_entries(
                     continue;
                 }
                 if entry.is_dir {
-                    fs::create_dir_all(dest.join(&entry.name))?;
+                    fs::create_dir_all(safe_entry_path(dest, &entry.name))?;
                     continue;
                 }
                 if entry.encrypted && password.is_none() {
@@ -287,7 +343,7 @@ fn extract_zip(path: &Path, dest: &Path, password: Option<&[u8]>) -> io::Result<
     let mut report = ExtractReport { files: 0, skipped_encrypted: 0, errors: Vec::new() };
     for entry in &entries {
         if entry.is_dir {
-            fs::create_dir_all(dest.join(&entry.name))?;
+            fs::create_dir_all(safe_entry_path(dest, &entry.name))?;
             continue;
         }
         if entry.encrypted && password.is_none() {
@@ -340,11 +396,36 @@ pub(crate) fn extract_one_zip_entry(
     if entry.method != 99 && archive::crc32(&content) != entry.crc32 {
         return Err(bad("CRC mismatch (wrong password?)"));
     }
-    let out_path = dest.join(&entry.name);
+    let out_path = safe_entry_path(dest, &entry.name);
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&out_path, &content)?;
+    restore_mtime(&out_path, entry.dos_date, entry.dos_time)?;
+    Ok(())
+}
+
+/// Entry name → dest path with traversal protection (`../`, absolute, `\`).
+fn safe_entry_path(dest: &Path, name: &str) -> PathBuf {
+    let rel = name.replace('\\', "/");
+    let rel = rel.trim_start_matches('/');
+    let clean: Vec<&str> = rel.split('/').filter(|c| !c.is_empty() && *c != "..").collect();
+    let mut p = dest.to_path_buf();
+    for c in &clean {
+        p.push(c);
+    }
+    p
+}
+
+/// Convert ZIP DOS date/time back to an mtime on the extracted file.
+fn restore_mtime(path: &Path, dos_date: u16, dos_time: u16) -> io::Result<()> {
+    let secs = archive::dos_datetime_to_unix(dos_date, dos_time);
+    if secs == 0 {
+        return Ok(());
+    }
+    let f = fs::OpenOptions::new().write(true).open(path)?;
+    let mtime = filetime::FileTime::from_system_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    filetime::set_file_handle_times(&f, None, Some(mtime))?;
     Ok(())
 }
 
@@ -423,6 +504,61 @@ pub fn compress(
     password: Option<&[u8]>,
     level: u32,
 ) -> io::Result<CompressReport> {
+    compress_as(inputs, out, password, level, None)
+}
+
+/// Compression output format, inferred from the file extension when not given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutFormat {
+    Zip,
+    SevenZ,
+    Tar,
+    TarGz,
+    TarXz,
+    TarBz2,
+    Gz,
+    Xz,
+    Bz2,
+}
+
+impl OutFormat {
+    /// Guess from the output file name; ZIP as the fall-back.
+    pub fn from_path(p: &Path) -> Self {
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            Self::TarGz
+        } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+            Self::TarXz
+        } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") {
+            Self::TarBz2
+        } else if name.ends_with(".tar") {
+            Self::Tar
+        } else if name.ends_with(".7z") {
+            Self::SevenZ
+        } else if name.ends_with(".zip") {
+            Self::Zip
+        } else if name.ends_with(".gz") {
+            Self::Gz
+        } else if name.ends_with(".xz") {
+            Self::Xz
+        } else if name.ends_with(".bz2") {
+            Self::Bz2
+        } else {
+            Self::Zip
+        }
+    }
+}
+
+/// Compress to any supported output format. `password` applies to ZIP
+/// (ZipCrypto) and 7z (AES-256, header also encrypted); it is ignored for
+/// tar/gz/xz/bz2 which have no encryption concept.
+pub fn compress_as(
+    inputs: &[PathBuf],
+    out: &Path,
+    password: Option<&[u8]>,
+    level: u32,
+    format: Option<OutFormat>,
+) -> io::Result<CompressReport> {
     if inputs.is_empty() {
         return Err(bad("no input files given"));
     }
@@ -431,19 +567,185 @@ pub fn compress(
             return Err(bad(&format!("input not found: {}", f.display())));
         }
     }
-    create_zip(inputs, out, password, level)
+    let fmt = format.unwrap_or_else(|| OutFormat::from_path(out));
+    match fmt {
+        OutFormat::Zip => create_zip(inputs, out, password, level),
+        OutFormat::SevenZ => create_7z(inputs, out, password),
+        OutFormat::Tar => create_tar(inputs, out, None),
+        OutFormat::TarGz => create_tar(inputs, out, Some(("gz", level))),
+        OutFormat::TarXz => create_tar(inputs, out, Some(("xz", level))),
+        OutFormat::TarBz2 => create_tar(inputs, out, Some(("bz2", level))),
+        OutFormat::Gz => single_stream(inputs, out, "gz"),
+        OutFormat::Xz => single_stream(inputs, out, "xz"),
+        OutFormat::Bz2 => single_stream(inputs, out, "bz2"),
+    }
 }
 
-struct CdRecord {
-    name: String,
-    method: u16,
-    crc: u32,
-    csize: u32,
-    usize_: u32,
-    offset: u32,
-    dos_time: u16,
-    dos_date: u16,
-    encrypted: bool,
+// ---------------------------------------------------------------------------
+// 7z writing (sevenz-rust: LZMA2 + optional AES-256 with encrypted header)
+// ---------------------------------------------------------------------------
+
+fn create_7z(inputs: &[PathBuf], out: &Path, password: Option<&[u8]>) -> io::Result<CompressReport> {
+    use sevenz_rust::SevenZWriter;
+
+    // (abs_path, archive_name) — directory inputs keep their "<dirname>/" prefix,
+    // consistent with create_tar/create_zip.
+    let mut plan: Vec<(PathBuf, String)> = Vec::new();
+    for f in inputs {
+        let base = f.parent().unwrap_or(f);
+        if f.is_dir() {
+            for d in walk_dirs(f) {
+                let rel = d.strip_prefix(base).unwrap_or(&d).to_string_lossy().replace('\\', "/");
+                plan.push((d, format!("{}/", rel.trim_end_matches('/'))));
+            }
+            for p in walk_files(f) {
+                let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                plan.push((p, rel));
+            }
+        } else {
+            let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            plan.push((f.clone(), name));
+        }
+    }
+
+    let mut sz = SevenZWriter::create(out).map_err(|e| bad(&e.to_string()))?;
+    // Header encryption only matters when there is a password; the writer
+    // defaults to true which produces encrypted headers for plain archives too.
+    sz.set_encrypt_header(password.is_some());
+    if let Some(pw) = password {
+        let opts = sevenz_rust::AesEncoderOptions::new(sevenz_rust::Password::from(
+            std::str::from_utf8(pw).unwrap_or_default(),
+        ));
+        sz.set_content_methods(vec![
+            sevenz_rust::SevenZMethodConfiguration::from(opts),
+        ]);
+    }
+
+    let mut n_files = 0usize;
+    for (f, name) in &plan {
+        let entry = sevenz_rust::SevenZArchiveEntry::from_path(f, name.clone());
+        let reader = if f.is_file() {
+            Some(fs::File::open(f)?)
+        } else {
+            None
+        };
+        sz.push_archive_entry(entry, reader)
+            .map_err(|e| bad(&format!("{}: {}", f.display(), e)))?;
+        n_files += 1;
+    }
+    sz.finish().map_err(|e| bad(&e.to_string()))?;
+    Ok(CompressReport { files: n_files, bytes: fs::metadata(out).map(|m| m.len()).unwrap_or(0) })
+}
+
+// ---------------------------------------------------------------------------
+// tar / tar.gz / tar.xz / tar.bz2 writing
+// ---------------------------------------------------------------------------
+
+fn create_tar(
+    inputs: &[PathBuf],
+    out: &Path,
+    outer: Option<(&str, u32)>,
+) -> io::Result<CompressReport> {
+    // Precompute (abs_path, archive_name) pairs. Directory inputs archive as
+    // "<dirname>/..." — matching 7-Zip/Bandizip behaviour — with explicit
+    // directory entries so empty dirs survive the round-trip.
+    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for f in inputs {
+        let base = f.parent().unwrap_or(f);
+        if f.is_dir() {
+            for d in walk_dirs(f) {
+                let rel = d.strip_prefix(base).unwrap_or(&d).to_path_buf();
+                plan.push((d, rel));
+            }
+            for p in walk_files(f) {
+                let rel = p.strip_prefix(base).unwrap_or(&p).to_path_buf();
+                plan.push((p, rel));
+            }
+        } else {
+            let name = Path::new(f.file_name().unwrap_or_default()).to_path_buf();
+            plan.push((f.clone(), name));
+        }
+    }
+
+    // Raw tar into the output (possibly through a compressor). The tar crate
+    // wraps any Write, so build the stream chain first.
+    let raw = fs::File::create(out)?;
+    let mut n_files = 0usize;
+
+    fn add_all<W: io::Write>(writer: W, plan: &[(PathBuf, PathBuf)], out_n: &mut usize) -> io::Result<()> {
+        let mut b = tar::Builder::new(writer);
+        // Directories first (parents before children), then regular files.
+        for (abs, rel) in plan {
+            if abs.is_dir() {
+                b.append_dir(rel, abs)?;
+                *out_n += 1;
+            }
+        }
+        for (abs, rel) in plan {
+            if abs.is_file() {
+                b.append_path_with_name(abs, rel)?;
+                *out_n += 1;
+            }
+        }
+        b.finish()?;
+        Ok(())
+    }
+
+    match outer {
+        None => add_all(raw, &plan, &mut n_files)?,
+        Some(("gz", lvl)) => {
+            let mut enc = flate2::write::GzEncoder::new(raw, flate2::Compression::new(lvl.min(9)));
+            add_all(&mut enc, &plan, &mut n_files)?;
+            enc.finish()?;
+        }
+        Some(("xz", lvl)) => {
+            let mut enc = liblzma::write::XzEncoder::new(raw, lvl.min(9));
+            add_all(&mut enc, &plan, &mut n_files)?;
+            enc.finish()?;
+        }
+        Some(("bz2", _)) => {
+            let mut enc = bzip2::write::BzEncoder::new(raw, bzip2::Compression::default());
+            add_all(&mut enc, &plan, &mut n_files)?;
+            enc.finish()?;
+        }
+        Some(_) => return Err(bad("unknown tar wrapper")),
+    }
+    Ok(CompressReport { files: n_files, bytes: fs::metadata(out).map(|m| m.len()).unwrap_or(0) })
+}
+
+// ---------------------------------------------------------------------------
+// gz / xz / bz2 single-stream writers (one input file only)
+// ---------------------------------------------------------------------------
+
+fn single_stream(inputs: &[PathBuf], out: &Path, codec: &str) -> io::Result<CompressReport> {
+    if inputs.len() != 1 || inputs[0].is_dir() {
+        return Err(bad(&format!(
+            "{} output takes exactly one input file",
+            codec.to_uppercase()
+        )));
+    }
+    let src = fs::read(&inputs[0])?;
+    let dst = fs::File::create(out)?;
+    let n = src.len() as u64;
+    match codec {
+        "gz" => {
+            let mut enc = flate2::write::GzEncoder::new(dst, flate2::Compression::default());
+            enc.write_all(&src)?;
+            enc.finish()?;
+        }
+        "xz" => {
+            let mut enc = liblzma::write::XzEncoder::new(dst, 6);
+            enc.write_all(&src)?;
+            enc.finish()?;
+        }
+        "bz2" => {
+            let mut enc = bzip2::write::BzEncoder::new(dst, bzip2::Compression::default());
+            enc.write_all(&src)?;
+            enc.finish()?;
+        }
+        _ => return Err(bad("unknown codec")),
+    }
+    Ok(CompressReport { files: 1, bytes: n })
 }
 
 fn create_zip(
@@ -488,6 +790,9 @@ fn create_zip(
         let name_bytes = name.as_bytes();
 
         // Plain payload vs ZipCrypto-encrypted (12-byte header + payload).
+        // EFS (bit 11) marks UTF-8 entry names — set whenever the name is
+        // not pure ASCII so 7-Zip/unzip decode it correctly.
+        let efs = 0x800u16 * is_ascii_name(&name) as u16;
         let (flags, stored): (u16, Vec<u8>) = match password {
             Some(pw) => {
                 let mut z = ZipCrypto::new(pw);
@@ -497,9 +802,9 @@ fn create_zip(
                 hdr[11] = (crc >> 24) as u8;
                 plain.splice(..0, hdr.iter().copied());
                 z.encrypt(&mut plain);
-                (0x1, plain)
+                (0x1 | efs, plain)
             }
-            None => (0x0, payload),
+            None => (efs, payload),
         };
 
         let mut lfh = [0u8; 30];
@@ -532,10 +837,20 @@ fn create_zip(
     };
 
     for f in inputs {
+        let base = f.parent().unwrap_or(f);
         if f.is_dir() {
+            // Explicit entry for the root dir (and empty subdirs), 7-Zip style.
+            for d in walk_dirs(f) {
+                let rel = d.strip_prefix(base).unwrap_or(&d).to_string_lossy().replace('\\', "/");
+                let name = format!("{}/", rel.trim_end_matches("/"));
+                write_zip_dir(&mut writer, &name, dos_time, dos_date, &mut central)?;
+            }
             for p in walk_files(f) {
-                let name =
-                    p.strip_prefix(f.parent().unwrap_or(f)).unwrap_or(&p).to_string_lossy().into_owned();
+                let name = p
+                    .strip_prefix(base)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 add(&mut writer, &p, name, &mut central)?;
                 n_files += 1;
             }
@@ -552,7 +867,9 @@ fn create_zip(
         cdh[..4].copy_from_slice(b"PK\x01\x02");
         cdh[4..6].copy_from_slice(&20u16.to_le_bytes());
         cdh[6..8].copy_from_slice(&20u16.to_le_bytes());
-        cdh[8..10].copy_from_slice(&(if e.encrypted { 1u16 } else { 0u16 }).to_le_bytes());
+        cdh[8..10].copy_from_slice(
+            &(if e.encrypted { 0x1 } else { 0x0 } | efs_flag(&e.name)).to_le_bytes(),
+        );
         cdh[10..12].copy_from_slice(&e.method.to_le_bytes());
         cdh[12..14].copy_from_slice(&e.dos_time.to_le_bytes());
         cdh[14..16].copy_from_slice(&e.dos_date.to_le_bytes());
@@ -593,6 +910,290 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     rec(dir, &mut out);
     out
+}
+
+/// Directories under `dir` (inclusive), depth-first, parents before children —
+/// used when the container format stores explicit directory entries.
+fn walk_dirs(dir: &Path) -> Vec<PathBuf> {
+    fn rec(dir: &Path, out: &mut Vec<PathBuf>) {
+        out.push(dir.to_path_buf());
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                rec(&p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(dir, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Archive editing: delete / rename entries (ZIP raw-copy rewrite; 7z rebuild)
+// ---------------------------------------------------------------------------
+
+/// Delete entries from an archive. ZIP entries are raw-copied (no recompress,
+/// byte-identical payloads); 7z/tar are rebuilt from a full re-extract.
+/// Matching is exact-name, or prefix when the pattern ends with `/`.
+pub fn delete_entries(path: &Path, patterns: &[String], password: Option<&[u8]>) -> io::Result<usize> {
+    if patterns.is_empty() {
+        return Err(bad("no entries selected"));
+    }
+    match archive::detect_format(path)? {
+        Format::Zip => delete_zip_entries(path, patterns),
+        _ => {
+            // Generic path: extract everything minus the targets to a temp dir,
+            // recompress, replace the original.
+            rebuild_archive_minus(path, patterns, password)
+        }
+    }
+}
+
+/// Rename entries. `renames` = (old_name, new_name) pairs; exact match only.
+pub fn rename_entries(path: &Path, renames: &[(String, String)], password: Option<&[u8]>) -> io::Result<usize> {
+    if renames.is_empty() {
+        return Err(bad("nothing to rename"));
+    }
+    match archive::detect_format(path)? {
+        Format::Zip => rename_zip_entries(path, renames),
+        _ => {
+            let tmp = path.with_extension("rosezip.tmp");
+            fs::copy(path, &tmp)?;
+            let res = rename_via_rebuild(&tmp, renames, password);
+            if res.is_ok() {
+                fs::rename(&tmp, path)?;
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+            res
+        }
+    }
+}
+
+fn matches_any(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        p == name
+            || (p.ends_with('/') && name.starts_with(p.as_str()))
+            || name
+                .strip_prefix(p.as_str())
+                .map_or(false, |rest| rest.starts_with('/'))
+    })
+}
+
+/// Shared low-level: rewrite a ZIP keeping entries for which `keep` is true;
+/// `map_name` rewrites entry names before they are written.
+fn rewrite_zip<F, G>(path: &Path, keep: F, map_name: G) -> io::Result<usize>
+where
+    F: Fn(&ZipEntry) -> bool,
+    G: Fn(String) -> String,
+{
+    let mut src = fs::File::open(path)?;
+    let entries = archive::parse_zip_central_directory(&mut src)?;
+    let tmp = path.with_extension("rosezip.tmp");
+    let mut dst = fs::File::create(&tmp)?;
+
+    let mut central: Vec<CdRecord> = Vec::new();
+    let mut kept = 0usize;
+    for e in &entries {
+        if !keep(e) {
+            continue;
+        }
+        kept += 1;
+        // Raw-copy the local header + payload, patching the name if renamed.
+        let data_off = archive::local_data_offset(&mut src, e)?;
+        let mut head = Vec::with_capacity((data_off - e.header_offset) as usize);
+        src.seek(SeekFrom::Start(e.header_offset))?;
+        Read::by_ref(&mut src).take(data_off - e.header_offset).read_to_end(&mut head)?;
+        let mut payload = vec![0u8; e.compressed_size as usize];
+        src.read_exact(&mut payload)?;
+
+        let new_name = map_name(e.name.clone());
+        let offset = dst.stream_position()? as u32;
+        // head = [30-byte LFH][old name][extra]; keep header + extra only.
+        let old_name_len = e.name.len();
+        let extra = head[(30 + old_name_len)..].to_vec();
+        head.truncate(30);
+        head[26..28].copy_from_slice(&(new_name.len() as u16).to_le_bytes());
+        // keep original flags; add EFS when the new name is non-ASCII,
+        // drop the data-descriptor bit (bit 3) since sizes are now known.
+        {
+            let mut flags = u16::from_le_bytes([head[6], head[7]]);
+            flags &= !0b1000;
+            flags |= efs_flag(&new_name);
+            head[6..8].copy_from_slice(&flags.to_le_bytes());
+        }
+        dst.write_all(&head)?;
+        dst.write_all(&extra)?;
+        dst.write_all(new_name.as_bytes())?;
+        dst.write_all(&payload)?;
+        central.push(CdRecord {
+            name: new_name,
+            method: e.method,
+            crc: e.crc32,
+            csize: e.compressed_size as u32,
+            usize_: e.uncompressed_size as u32,
+            offset,
+            dos_time: e.dos_time,
+            dos_date: e.dos_date,
+            encrypted: e.encrypted,
+        });
+    }
+
+    let cd_offset = dst.stream_position()? as u32;
+    for c in &central {
+        let mut cdh = [0u8; 46];
+        cdh[..4].copy_from_slice(b"PK\x01\x02");
+        cdh[4..6].copy_from_slice(&20u16.to_le_bytes());
+        cdh[6..8].copy_from_slice(&20u16.to_le_bytes());
+        cdh[8..10].copy_from_slice(
+            &(if c.encrypted { 0x1 } else { 0x0 } | efs_flag(&c.name)).to_le_bytes(),
+        );
+        cdh[10..12].copy_from_slice(&c.method.to_le_bytes());
+        cdh[12..14].copy_from_slice(&c.dos_time.to_le_bytes());
+        cdh[14..16].copy_from_slice(&c.dos_date.to_le_bytes());
+        cdh[16..20].copy_from_slice(&c.crc.to_le_bytes());
+        cdh[20..24].copy_from_slice(&c.csize.to_le_bytes());
+        cdh[24..28].copy_from_slice(&c.usize_.to_le_bytes());
+        cdh[28..30].copy_from_slice(&(c.name.len() as u16).to_le_bytes());
+        cdh[42..46].copy_from_slice(&c.offset.to_le_bytes());
+        dst.write_all(&cdh)?;
+        dst.write_all(c.name.as_bytes())?;
+    }
+    let cd_size = dst.stream_position()? as u32 - cd_offset;
+    let mut eocd = [0u8; 22];
+    eocd[..4].copy_from_slice(b"PK\x05\x06");
+    eocd[8..10].copy_from_slice(&(central.len() as u16).to_le_bytes());
+    eocd[10..12].copy_from_slice(&(central.len() as u16).to_le_bytes());
+    eocd[12..16].copy_from_slice(&cd_size.to_le_bytes());
+    eocd[16..20].copy_from_slice(&cd_offset.to_le_bytes());
+    dst.write_all(&eocd)?;
+    drop(dst);
+    fs::rename(&tmp, path)?;
+    Ok(kept)
+}
+
+fn delete_zip_entries(path: &Path, patterns: &[String]) -> io::Result<usize> {
+    let mut src = fs::File::open(path)?;
+    let entries = archive::parse_zip_central_directory(&mut src)?;
+    let total = entries.len();
+    let n = rewrite_zip(path, |e| !matches_any(&e.name, patterns), |n| n)?;
+    Ok(total - n)
+}
+
+fn rename_zip_entries(path: &Path, renames: &[(String, String)]) -> io::Result<usize> {
+    let map = |name: String| -> String {
+        for (old, new) in renames {
+            if &name == old {
+                return new.clone();
+            }
+            // Renaming a directory prefix moves all children.
+            if old.ends_with('/') && name.starts_with(old.as_str()) {
+                return format!("{}{}", new, &name[old.len()..]);
+            }
+        }
+        name
+    };
+    let mut src = fs::File::open(path)?;
+    let entries = archive::parse_zip_central_directory(&mut src)?;
+    let n = entries
+        .iter()
+        .filter(|e| renames.iter().any(|(o, _)| {
+            o == &e.name || (o.ends_with('/') && e.name.starts_with(o.as_str()))
+        }))
+        .count();
+    rewrite_zip(path, |_| true, map)?;
+    Ok(n)
+}
+
+/// Non-ZIP editing fallback: extract to temp (minus targets), recompress.
+fn rebuild_archive_minus(path: &Path, patterns: &[String], password: Option<&[u8]>) -> io::Result<usize> {
+    let entries = archive::list_archive(path)?.entries;
+    let doomed: Vec<String> = entries
+        .iter()
+        .filter(|e| matches_any(&e.name, patterns))
+        .map(|e| e.name.clone())
+        .collect();
+    if doomed.is_empty() {
+        return Err(bad("no matching entries found"));
+    }
+    let tmpdir = std::env::temp_dir().join(format!("rosezip-edit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmpdir);
+    archive::extract_native(path, &tmpdir, password)?;
+    for d in &doomed {
+        let p = tmpdir.join(d.trim_end_matches('/'));
+        if p.is_dir() {
+            let _ = fs::remove_dir_all(&p);
+        } else {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    let tmp_out = path.with_extension("rosezip.tmp");
+    // Rebuild in the same container format. Inputs are the extracted
+    // *children* (not tmpdir itself) so no extra path layer is added.
+    let mut roots: Vec<PathBuf> = fs::read_dir(&tmpdir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    roots.sort();
+    let empty = Vec::new();
+    let roots_ref: &[PathBuf] = if roots.is_empty() { &empty } else { &roots };
+    let report = match archive::detect_format(path)? {
+        Format::SevenZ => create_7z(roots_ref, &tmp_out, password)?,
+        Format::Tar => create_tar(roots_ref, &tmp_out, None)?,
+        Format::Gz => create_tar(roots_ref, &tmp_out, Some(("gz", 6)))?,
+        Format::Xz => create_tar(roots_ref, &tmp_out, Some(("xz", 6)))?,
+        Format::Bz2 => create_tar(roots_ref, &tmp_out, Some(("bz2", 6)))?,
+        Format::Zip => unreachable!(),
+    };
+    let _ = report;
+    fs::rename(&tmp_out, path)?;
+    let _ = fs::remove_dir_all(&tmpdir);
+    Ok(doomed.len())
+}
+
+fn rename_via_rebuild(path: &Path, renames: &[(String, String)], password: Option<&[u8]>) -> io::Result<usize> {
+    let entries = archive::list_archive(path)?.entries;
+    let hits: Vec<String> = entries
+        .iter()
+        .filter(|e| renames.iter().any(|(o, _)| o == &e.name))
+        .map(|e| e.name.clone())
+        .collect();
+    if hits.is_empty() {
+        return Err(bad("no matching entries found"));
+    }
+    let tmpdir = std::env::temp_dir().join(format!("rosezip-edit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmpdir);
+    archive::extract_native(path, &tmpdir, password)?;
+    for (old, new) in renames {
+        let from = tmpdir.join(old.trim_end_matches('/'));
+        let to = tmpdir.join(new.trim_end_matches('/'));
+        if from.exists() {
+            if let Some(parent) = to.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::rename(&from, &to)?;
+        }
+    }
+    let tmp_out = path.with_extension("rosezip.tmp");
+    let mut roots: Vec<PathBuf> = fs::read_dir(&tmpdir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    roots.sort();
+    match archive::detect_format(path)? {
+        Format::SevenZ => {
+            create_7z(&roots, &tmp_out, password)?;
+        }
+        _ => {
+            create_tar(&roots, &tmp_out, None)?;
+        }
+    }
+    fs::rename(&tmp_out, path)?;
+    let _ = fs::remove_dir_all(&tmpdir);
+    Ok(hits.len())
 }
 
 // ---------------------------------------------------------------------------

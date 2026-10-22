@@ -27,6 +27,40 @@ pub enum Format {
     Bz2,
 }
 
+/// Inner format of a gz/xz/bz2 stream: `Some(inner)` when the decompressed
+/// payload is itself an archive we support (tar), `None` otherwise.
+pub fn compressed_inner_format(path: &Path, format: Format) -> Option<Format> {
+    if !matches!(format, Format::Gz | Format::Xz | Format::Bz2) {
+        return None;
+    }
+    let peek = match format {
+        Format::Gz => {
+            let raw = fs::read(path).ok()?;
+            let mut out = Vec::with_capacity(512);
+            flate2::read::MultiGzDecoder::new(&raw[..]).read_to_end(&mut out).ok()?;
+            out
+        }
+        Format::Xz => {
+            let raw = fs::read(path).ok()?;
+            let mut out = Vec::with_capacity(512);
+            liblzma::read::XzDecoder::new(&raw[..]).read_to_end(&mut out).ok()?;
+            out
+        }
+        Format::Bz2 => {
+            let raw = fs::read(path).ok()?;
+            let mut out = Vec::with_capacity(512);
+            bzip2::read::BzDecoder::new(&raw[..]).read_to_end(&mut out).ok()?;
+            out
+        }
+        _ => return None,
+    };
+    // ustar magic at offset 257 → it's a tar.
+    if peek.len() > 262 && &peek[257..262] == b"ustar" {
+        return Some(Format::Tar);
+    }
+    None
+}
+
 pub fn detect_format(path: &Path) -> io::Result<Format> {
     let mut file = fs::File::open(path)?;
     let mut magic = [0u8; 6];
@@ -300,8 +334,40 @@ pub struct EntryInfo {
     pub mtime: u64,
 }
 
+/// Decompress a gz/xz/bz2 stream into a temp file (used when its payload is
+/// itself an archive, e.g. .tar.gz). Returns the temp file path.
+fn decompressed_to_temp(path: &Path, format: Format) -> io::Result<PathBuf> {
+    let raw = fs::read(path)?;
+    let mut out = Vec::with_capacity(raw.len() * 4);
+    match format {
+        Format::Gz => {
+            flate2::read::MultiGzDecoder::new(&raw[..]).read_to_end(&mut out).map(|_| ())?
+        }
+        Format::Xz => {
+            liblzma::read::XzDecoder::new(&raw[..]).read_to_end(&mut out).map(|_| ())?
+        }
+        Format::Bz2 => {
+            bzip2::read::BzDecoder::new(&raw[..]).read_to_end(&mut out).map(|_| ())?
+        }
+        _ => return Err(bad("not a compressed stream")),
+    }
+    let tmp = std::env::temp_dir().join(format!("rosezip-inner-{}", std::process::id()));
+    fs::write(&tmp, &out)?;
+    Ok(tmp)
+}
+
 pub fn list_archive(path: &Path) -> io::Result<ArchiveInfo> {
     let format = detect_format(path)?;
+    // .tar.gz / .tar.xz / .tar.bz2: list the inner tar with full entry info.
+    if let Some(Format::Tar) = compressed_inner_format(path, format) {
+        let tmp = decompressed_to_temp(path, format)?;
+        let res = list_archive(&tmp);
+        let _ = fs::remove_file(&tmp);
+        let mut info = res?;
+        info.format = format;
+        info.path = path.to_path_buf();
+        return Ok(info);
+    }
     let entries = match format {
         Format::Zip => {
             let mut file = fs::File::open(path)?;
@@ -417,7 +483,15 @@ pub fn dos_to_unix(dos_time: u16) -> u64 {
 /// Extract an archive into `dest` — fully in-process for all supported formats.
 pub fn extract_native(archive: &Path, dest: &Path, password: Option<&[u8]>) -> io::Result<()> {
     fs::create_dir_all(dest)?;
-    match detect_format(archive)? {
+    let format = detect_format(archive)?;
+    // .tar.gz / .tar.xz / .tar.bz2: decompress to a temp file, unpack the tar.
+    if let Some(Format::Tar) = compressed_inner_format(archive, format) {
+        let tmp = decompressed_to_temp(archive, format)?;
+        let res = extract_native(&tmp, dest, None);
+        let _ = fs::remove_file(&tmp);
+        return res;
+    }
+    match format {
         Format::Zip => Err(bad("zip handled by ops::extract")),
         Format::SevenZ => extract_7z(archive, dest, password),
         Format::Tar => extract_tar(archive, dest),

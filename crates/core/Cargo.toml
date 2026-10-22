@@ -8,7 +8,8 @@ license = "GPL-3.0-only"
 [dependencies]
 flate2 = { workspace = true }
 crossbeam-channel = { workspace = true }
-sevenz-rust = { version = "0.6", features = ["aes256"] }
+sevenz-rust = { version = "0.6", features = ["aes256", "compress"] }
 tar = "0.4"
 bzip2 = "0.4"
 liblzma = { version = "0.3", features = ["static"] }
+filetime = "0.2"

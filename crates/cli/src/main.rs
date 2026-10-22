@@ -32,7 +32,7 @@ enum Cmd {
         #[arg(short, long)]
         password: Option<String>,
     },
-    /// Create a ZIP archive (native ZipCrypto encryption with -p)
+    /// Create an archive (ZIP by default; -f selects 7z/tar/tar.gz/tar.xz/tar.bz2/gz/xz/bz2)
     Compress {
         files: Vec<std::path::PathBuf>,
         #[arg(short, long)]
@@ -41,6 +41,9 @@ enum Cmd {
         password: Option<String>,
         #[arg(short, long, default_value = "6")]
         level: u32,
+        /// Output format (default: inferred from -o extension, else zip)
+        #[arg(short = 'F', long)]
+        format: Option<String>,
     },
     /// Show archive info and encryption type
     Check { file: std::path::PathBuf },
@@ -65,6 +68,23 @@ enum Cmd {
     /// Test archive integrity (decode everything, verify checksums)
     Test {
         file: std::path::PathBuf,
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+    /// Delete entries from an archive (in place; prefix match with trailing /)
+    Delete {
+        file: std::path::PathBuf,
+        /// Entry names (use `dir/` to remove a whole folder)
+        #[arg(required = true)]
+        entries: Vec<String>,
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+    /// Rename an entry inside an archive (in place)
+    Rename {
+        file: std::path::PathBuf,
+        /// OLD=NEW pair (use dir/ prefix to rename a folder)
+        pairs: Vec<String>,
         #[arg(short, long)]
         password: Option<String>,
     },
