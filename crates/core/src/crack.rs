@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::charset::IndexGen;
+use crate::charset::{IndexGen, MaskGen};
 use crate::progress::Progress;
 use crate::zipcrypt::Verifier;
 
@@ -75,6 +75,9 @@ pub struct CrackHandle {
 #[derive(Clone)]
 pub enum CrackTarget {
     Brute { gen: IndexGen },
+    /// Mask pattern attack: `Rose?d?d?d?d` — each `?x` slot has its own
+    /// charset, literal text is pinned. Works for both ZipCrypto and AES.
+    Mask { mask: MaskGen },
     Dictionary { path: PathBuf },
 }
 
@@ -83,6 +86,7 @@ pub fn spawn_job(target: CrackTarget, verifier: Arc<Verifier>, threads: usize) -
     let shared = Arc::new(JobShared {
         progress: Progress::new(match &target {
             CrackTarget::Brute { gen } => Some(gen.total),
+            CrackTarget::Mask { mask } => Some(mask.total),
             CrackTarget::Dictionary { .. } => None,
         }),
         cancel: Arc::new(AtomicBool::new(false)),
@@ -96,6 +100,9 @@ pub fn spawn_job(target: CrackTarget, verifier: Arc<Verifier>, threads: usize) -
         match &target {
             CrackTarget::Brute { gen } => {
                 found = run_workers(gen, verifier, &opts, &sup_shared.progress, &sup_shared.cancel);
+            }
+            CrackTarget::Mask { mask } => {
+                found = run_mask_workers(mask, verifier, &opts, &sup_shared.progress, &sup_shared.cancel);
             }
             CrackTarget::Dictionary { path } => {
                 match load_dictionary(path) {
@@ -184,6 +191,22 @@ pub fn crack_dictionary(
     finish_blocking(progress, printer, found)
 }
 
+/// Mask-pattern attack (blocking). Pattern like `Rose?d?d?d?d` — see
+/// [`MaskGen`] for the placeholder syntax.
+pub fn crack_mask(
+    pattern: &str,
+    verifier: Arc<Verifier>,
+    opts: &CrackOptions,
+) -> io::Result<CrackResult> {
+    let mask = MaskGen::parse(pattern)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let progress = Progress::new(Some(mask.total));
+    let printer = printer_for(opts, &progress);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let found = run_mask_workers(&mask, verifier, opts, &progress, &cancel);
+    finish_blocking(progress, printer, found)
+}
+
 fn printer_for(opts: &CrackOptions, progress: &Arc<Progress>) -> Option<thread::JoinHandle<()>> {
     if opts.quiet {
         None
@@ -243,6 +266,57 @@ fn run_workers(
                 Verifier::WinZipAes { .. } => {
                     bruteforce_generic(&gen, &verifier, start, end, &progress, &found, &stop)
                 }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    found
+}
+
+/// Static chunking over the mask's candidate space; the AES path does full
+/// PBKDF2 per candidate, the ZipCrypto path uses the same worker with the
+/// quick/confirm two-stage check (the prefix-key trick does not apply when
+/// each position has its own charset, but ZipCrypto quick_check is already
+/// very fast).
+fn run_mask_workers(
+    mask: &MaskGen,
+    verifier: Arc<Verifier>,
+    opts: &CrackOptions,
+    progress: &Arc<Progress>,
+    stop: &Arc<AtomicBool>,
+) -> Arc<Mutex<Option<Vec<u8>>>> {
+    let total = mask.total;
+    let threads = opts.threads.max(1);
+    let chunk = total / threads as u64 + 1;
+    let found: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+
+    let mut handles = Vec::with_capacity(threads);
+    for t in 0..threads {
+        let mask = mask.clone();
+        let verifier = verifier.clone();
+        let progress = progress.clone();
+        let found = found.clone();
+        let stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            let start = (t as u64) * chunk;
+            let end = (start + chunk).min(total);
+            for idx in start..end {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let cand = mask.password_at(idx);
+                if verifier.quick_check(cand.as_slice()) && verifier.confirm(cand.as_slice()) {
+                    let mut g = found.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(cand.as_slice().to_vec());
+                    }
+                    progress.found.store(true, Ordering::Relaxed);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                progress.done.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }
@@ -489,8 +563,9 @@ fn bruteforce_generic(
 // ---------------------------------------------------------------------------
 
 /// Load a word list as a full-lifetime byte slice.
-/// mmap on Unix, plain read elsewhere.
-fn load_dictionary(path: &Path) -> io::Result<&'static [u8]> {
+/// mmap on Unix, plain read elsewhere. Public so the CLI can share the
+/// same mmap for its own multi-threaded 7z dictionary attack.
+pub fn load_dictionary(path: &Path) -> io::Result<&'static [u8]> {
     #[cfg(unix)]
     {
         unsafe { mmap_file(path) }

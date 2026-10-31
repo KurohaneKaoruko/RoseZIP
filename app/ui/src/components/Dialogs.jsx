@@ -416,6 +416,8 @@ export function CrackDialog({ path, onClose, onFound }) {
   const [charset, setCharset] = useState("lower");
   const [minLen, setMinLen] = useState(1);
   const [maxLen, setMaxLen] = useState(6);
+  const [mask, setMask] = useState("");
+  const [maskSpace, setMaskSpace] = useState(null);
   const [dictionary, setDictionary] = useState("");
   const [space, setSpace] = useState(null);
   const [status, setStatus] = useState(null);
@@ -437,25 +439,37 @@ export function CrackDialog({ path, onClose, onFound }) {
   }, [path]);
 
   useEffect(() => {
-    if (mode !== "brute") return undefined;
+    if (mode !== "brute" && mode !== "mask") return undefined;
     let alive = true;
     const t = window.setTimeout(async () => {
       try {
-        const r = await invoke("estimate_space", {
-          charset: charset.trim() || "lower",
-          minLen,
-          maxLen,
-        });
-        if (alive) setSpace(r);
+        if (mode === "mask") {
+          if (!mask.trim()) {
+            if (alive) setMaskSpace(null);
+            return;
+          }
+          const r = await invoke("estimate_mask_space", { pattern: mask.trim() });
+          if (alive) setMaskSpace(r);
+        } else {
+          const r = await invoke("estimate_space", {
+            charset: charset.trim() || "lower",
+            minLen,
+            maxLen,
+          });
+          if (alive) setSpace(r);
+        }
       } catch {
-        if (alive) setSpace(null);
+        if (alive) {
+          if (mode === "mask") setMaskSpace(null);
+          else setSpace(null);
+        }
       }
     }, 200);
     return () => {
       alive = false;
       window.clearTimeout(t);
     };
-  }, [mode, charset, minLen, maxLen]);
+  }, [mode, charset, minLen, maxLen, mask]);
 
   useEffect(
     () => () => {
@@ -474,6 +488,9 @@ export function CrackDialog({ path, onClose, onFound }) {
           minLen,
           maxLen,
         });
+      } else if (mode === "mask") {
+        params.mode = "mask";
+        params.mask = mask.trim();
       } else {
         params.dictionary = dictionary.trim();
       }
@@ -536,7 +553,10 @@ export function CrackDialog({ path, onClose, onFound }) {
               icon="play"
               onClick={start}
               loading={starting}
-              disabled={mode === "dictionary" && !dictionary.trim()}
+              disabled={
+                (mode === "dictionary" && !dictionary.trim()) ||
+                (mode === "mask" && !mask.trim())
+              }
             >
               开始
             </Button>
@@ -567,6 +587,13 @@ export function CrackDialog({ path, onClose, onFound }) {
               <div className="frow-main seg-tight">
                 <button className={mode === "brute" ? "active" : ""} onClick={() => setMode("brute")} disabled={running}>
                   暴力
+                </button>
+                <button
+                  className={mode === "mask" ? "active" : ""}
+                  onClick={() => setMode("mask")}
+                  disabled={running}
+                >
+                  掩码
                 </button>
                 <button
                   className={mode === "dictionary" ? "active" : ""}
@@ -641,6 +668,21 @@ export function CrackDialog({ path, onClose, onFound }) {
                   </Banner>
                 )}
               </>
+            ) : mode === "mask" ? (
+              <label className="frow">
+                <span className="frow-label">掩码</span>
+                <div className="frow-main row-tight">
+                  <input
+                    className="input mono grow"
+                    value={mask}
+                    onChange={(e) => setMask(e.target.value)}
+                    placeholder="Rose?d?d?d?d  （?l 小写 ?u 大写 ?d 数字 ?s 符号 ?a 字母数字 ?h 十六进制）"
+                    spellCheck={false}
+                    disabled={running}
+                  />
+                  <span className="ck-space mono">{maskSpace ? maskSpace.total_pretty : ""}</span>
+                </div>
+              </label>
             ) : (
               <label className="frow">
                 <span className="frow-label">字典</span>

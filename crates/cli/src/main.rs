@@ -31,6 +31,12 @@ enum Cmd {
         out_dir: Option<std::path::PathBuf>,
         #[arg(short, long)]
         password: Option<String>,
+        /// Only extract entries matching these prefixes (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Skip entries matching these prefixes (repeatable, wins over --include)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Create an archive (ZIP by default; -f selects 7z/tar/tar.gz/tar.xz/tar.bz2/gz/xz/bz2)
     Compress {
@@ -58,6 +64,9 @@ enum Cmd {
         min_len: usize,
         #[arg(short = 'x', long, default_value = "6")]
         max_len: usize,
+        /// Mask pattern attack, e.g. `Rose?d?d?d?d` (?l ?u ?d ?s ?a ?h ?H …)
+        #[arg(short = 'm', long)]
+        mask: Option<String>,
         #[arg(short, long)]
         dictionary: Option<std::path::PathBuf>,
         #[arg(short = 'P', long, default_value_t = rosezip_core::crack::num_cpus())]

@@ -339,6 +339,86 @@ pub struct ExtractReport {
     pub errors: Vec<String>,
 }
 
+/// Extract with include/exclude prefix filters (CLI `--include`/`--exclude`).
+/// Exclusions always win; when includes are given, only matching entries go
+/// out. Non-ZIP formats extract everything first, then prune.
+pub fn extract_filtered(
+    path: &Path,
+    dest: &Path,
+    password: Option<&[u8]>,
+    include: &[String],
+    exclude: &[String],
+) -> io::Result<ExtractReport> {
+    let wanted = |name: &str| -> bool {
+        (!exclude.is_empty() && matches_any(name, exclude))
+            || (!include.is_empty() && !matches_any(name, include))
+    };
+    match archive::detect_format(path)? {
+        Format::Zip => {
+            fs::create_dir_all(dest)?;
+            let mut file = fs::File::open(path)?;
+            let entries = archive::parse_zip_central_directory(&mut file)?;
+            let mut report = ExtractReport { files: 0, skipped_encrypted: 0, errors: Vec::new() };
+            for entry in &entries {
+                if wanted(&entry.name) {
+                    continue;
+                }
+                if entry.is_dir {
+                    fs::create_dir_all(safe_entry_path(dest, &entry.name))?;
+                    continue;
+                }
+                if entry.encrypted && password.is_none() {
+                    report.skipped_encrypted += 1;
+                    report.errors.push(format!("{}: encrypted (password required)", entry.name));
+                    continue;
+                }
+                match extract_one_zip_entry(&mut file, entry, dest, password) {
+                    Ok(()) => report.files += 1,
+                    Err(e) => report.errors.push(format!("{}: {}", entry.name, e)),
+                }
+            }
+            Ok(report)
+        }
+        _ => {
+            let report = extract(path, dest, password)?;
+            if !exclude.is_empty() || !include.is_empty() {
+                prune_entries(dest, &wanted)?;
+            }
+            Ok(report)
+        }
+    }
+}
+
+/// Remove extracted files/dirs whose relative path no longer matches the filters.
+fn prune_entries(dest: &Path, wanted: &dyn Fn(&str) -> bool) -> io::Result<()> {
+    fn walk(dir: &Path, dest: &Path, wanted: &dyn Fn(&str) -> bool) -> io::Result<bool> {
+        // Returns true when the whole dir should be removed.
+        let mut keep_any = false;
+        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let rel = p.strip_prefix(dest).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            let name = format!("{}/", rel);
+            if p.is_dir() {
+                if !walk(&p, dest, wanted)? {
+                    keep_any = true;
+                }
+            } else if wanted(&rel) {
+                let _ = fs::remove_file(&p);
+            } else {
+                keep_any = true;
+            }
+            let _ = name;
+        }
+        Ok(!keep_any)
+    }
+    if walk(dest, dest, wanted)? {
+        return Ok(());
+    }
+    Ok(())
+}
+
 fn extract_zip(path: &Path, dest: &Path, password: Option<&[u8]>) -> io::Result<ExtractReport> {
     let mut file = fs::File::open(path)?;
     let entries = archive::parse_zip_central_directory(&mut file)?;
@@ -549,6 +629,30 @@ impl OutFormat {
             Self::Zip
         }
     }
+
+    /// Parse a user-supplied format name (CLI `-F` / TUI prompt).
+    pub fn parse_out_format(s: &str) -> io::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "zip" => Ok(Self::Zip),
+            "7z" => Ok(Self::SevenZ),
+            "tar" => Ok(Self::Tar),
+            "tar.gz" | "tgz" => Ok(Self::TarGz),
+            "tar.xz" | "txz" => Ok(Self::TarXz),
+            "tar.bz2" | "tbz2" => Ok(Self::TarBz2),
+            "gz" => Ok(Self::Gz),
+            "xz" => Ok(Self::Xz),
+            "bz2" => Ok(Self::Bz2),
+            other => Err(bad(&format!(
+                "unknown format '{}' (zip/7z/tar/tar.gz/tar.xz/tar.bz2/gz/xz/bz2)",
+                other
+            ))),
+        }
+    }
+}
+
+/// Parse a user-supplied output-format name (module-level convenience for TUI).
+pub fn parse_out_format(s: &str) -> io::Result<OutFormat> {
+    OutFormat::parse_out_format(s)
 }
 
 /// Compress to any supported output format. `password` applies to ZIP
@@ -572,14 +676,14 @@ pub fn compress_as(
     let fmt = format.unwrap_or_else(|| OutFormat::from_path(out));
     match fmt {
         OutFormat::Zip => create_zip(inputs, out, password, level),
-        OutFormat::SevenZ => create_7z(inputs, out, password),
+        OutFormat::SevenZ => create_7z(inputs, out, password, level),
         OutFormat::Tar => create_tar(inputs, out, None),
         OutFormat::TarGz => create_tar(inputs, out, Some(("gz", level))),
         OutFormat::TarXz => create_tar(inputs, out, Some(("xz", level))),
         OutFormat::TarBz2 => create_tar(inputs, out, Some(("bz2", level))),
-        OutFormat::Gz => single_stream(inputs, out, "gz"),
-        OutFormat::Xz => single_stream(inputs, out, "xz"),
-        OutFormat::Bz2 => single_stream(inputs, out, "bz2"),
+        OutFormat::Gz => single_stream(inputs, out, "gz", level),
+        OutFormat::Xz => single_stream(inputs, out, "xz", level),
+        OutFormat::Bz2 => single_stream(inputs, out, "bz2", level),
     }
 }
 
@@ -587,7 +691,12 @@ pub fn compress_as(
 // 7z writing (sevenz-rust: LZMA2 + optional AES-256 with encrypted header)
 // ---------------------------------------------------------------------------
 
-fn create_7z(inputs: &[PathBuf], out: &Path, password: Option<&[u8]>) -> io::Result<CompressReport> {
+fn create_7z(
+    inputs: &[PathBuf],
+    out: &Path,
+    password: Option<&[u8]>,
+    level: u32,
+) -> io::Result<CompressReport> {
     use sevenz_rust::SevenZWriter;
 
     // (abs_path, archive_name) — directory inputs keep their "<dirname>/" prefix,
@@ -614,12 +723,20 @@ fn create_7z(inputs: &[PathBuf], out: &Path, password: Option<&[u8]>) -> io::Res
     // Header encryption only matters when there is a password; the writer
     // defaults to true which produces encrypted headers for plain archives too.
     sz.set_encrypt_header(password.is_some());
+    // Method chain, innermost first (library convention): LZMA2 compression
+    // then AES-256 encryption on top. `level` maps to the LZMA2 preset.
+    let lzma2 = sevenz_rust::lzma::LZMA2Options::with_preset(level.min(9).max(1));
     if let Some(pw) = password {
-        let opts = sevenz_rust::AesEncoderOptions::new(sevenz_rust::Password::from(
-            std::str::from_utf8(pw).unwrap_or_default(),
-        ));
         sz.set_content_methods(vec![
-            sevenz_rust::SevenZMethodConfiguration::from(opts),
+            sevenz_rust::AesEncoderOptions::new(sevenz_rust::Password::from(
+                std::str::from_utf8(pw).unwrap_or_default(),
+            ))
+            .into(),
+            sevenz_rust::SevenZMethodConfiguration::from(lzma2),
+        ]);
+    } else {
+        sz.set_content_methods(vec![
+            sevenz_rust::SevenZMethodConfiguration::from(lzma2),
         ]);
     }
 
@@ -705,8 +822,13 @@ fn create_tar(
             add_all(&mut enc, &plan, &mut n_files)?;
             enc.finish()?;
         }
-        Some(("bz2", _)) => {
-            let mut enc = bzip2::write::BzEncoder::new(raw, bzip2::Compression::default());
+        Some(("bz2", lvl)) => {
+            let lvl = match lvl.min(9) {
+                0..=3 => bzip2::Compression::fast(),
+                4..=6 => bzip2::Compression::default(),
+                _ => bzip2::Compression::best(),
+            };
+            let mut enc = bzip2::write::BzEncoder::new(raw, lvl);
             add_all(&mut enc, &plan, &mut n_files)?;
             enc.finish()?;
         }
@@ -719,7 +841,7 @@ fn create_tar(
 // gz / xz / bz2 single-stream writers (one input file only)
 // ---------------------------------------------------------------------------
 
-fn single_stream(inputs: &[PathBuf], out: &Path, codec: &str) -> io::Result<CompressReport> {
+fn single_stream(inputs: &[PathBuf], out: &Path, codec: &str, level: u32) -> io::Result<CompressReport> {
     if inputs.len() != 1 || inputs[0].is_dir() {
         return Err(bad(&format!(
             "{} output takes exactly one input file",
@@ -731,17 +853,22 @@ fn single_stream(inputs: &[PathBuf], out: &Path, codec: &str) -> io::Result<Comp
     let n = src.len() as u64;
     match codec {
         "gz" => {
-            let mut enc = flate2::write::GzEncoder::new(dst, flate2::Compression::default());
+            let mut enc = flate2::write::GzEncoder::new(dst, flate2::Compression::new(level.min(9)));
             enc.write_all(&src)?;
             enc.finish()?;
         }
         "xz" => {
-            let mut enc = liblzma::write::XzEncoder::new(dst, 6);
+            let mut enc = liblzma::write::XzEncoder::new(dst, level.min(9));
             enc.write_all(&src)?;
             enc.finish()?;
         }
         "bz2" => {
-            let mut enc = bzip2::write::BzEncoder::new(dst, bzip2::Compression::default());
+            let lvl = match level.min(9) {
+                0..=3 => bzip2::Compression::fast(),
+                4..=6 => bzip2::Compression::default(),
+                _ => bzip2::Compression::best(),
+            };
+            let mut enc = bzip2::write::BzEncoder::new(dst, lvl);
             enc.write_all(&src)?;
             enc.finish()?;
         }
@@ -1143,7 +1270,7 @@ fn rebuild_archive_minus(path: &Path, patterns: &[String], password: Option<&[u8
     let empty = Vec::new();
     let roots_ref: &[PathBuf] = if roots.is_empty() { &empty } else { &roots };
     let report = match archive::detect_format(path)? {
-        Format::SevenZ => create_7z(roots_ref, &tmp_out, password)?,
+        Format::SevenZ => create_7z(roots_ref, &tmp_out, password, 6)?,
         Format::Tar => create_tar(roots_ref, &tmp_out, None)?,
         Format::Gz => create_tar(roots_ref, &tmp_out, Some(("gz", 6)))?,
         Format::Xz => create_tar(roots_ref, &tmp_out, Some(("xz", 6)))?,
@@ -1187,7 +1314,7 @@ fn rename_via_rebuild(path: &Path, renames: &[(String, String)], password: Optio
     roots.sort();
     match archive::detect_format(path)? {
         Format::SevenZ => {
-            create_7z(&roots, &tmp_out, password)?;
+            create_7z(&roots, &tmp_out, password, 6)?;
         }
         _ => {
             create_tar(&roots, &tmp_out, None)?;
