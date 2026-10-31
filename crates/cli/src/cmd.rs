@@ -11,17 +11,17 @@ use crate::Cmd;
 pub fn dispatch(cmd: Cmd) -> io::Result<String> {
     match cmd {
         Cmd::List { file } => cmd_list(&file),
-        Cmd::Extract { file, out_dir, password } => {
+        Cmd::Extract { file, out_dir, password, include, exclude } => {
             let dest = out_dir.unwrap_or_else(|| PathBuf::from("."));
-            cmd_extract(&file, &dest, password.as_deref())
+            cmd_extract(&file, &dest, password.as_deref(), &include, &exclude)
         }
         Cmd::Compress { files, out, password, level, format } => {
             cmd_compress(files, &out, password.as_deref(), level, format.as_deref())
         }
         Cmd::Check { file } => cmd_check(&file),
         Cmd::Bench => cmd_bench(),
-        Cmd::Crack { file, charset, min_len, max_len, dictionary, threads, quiet } => {
-            cmd_crack(&file, &charset, min_len, max_len, dictionary.as_deref(), threads, quiet)
+        Cmd::Crack { file, charset, min_len, max_len, mask, dictionary, threads, quiet } => {
+            cmd_crack(&file, &charset, min_len, max_len, mask.as_deref(), dictionary.as_deref(), threads, quiet)
         }
         Cmd::Test { file, password } => cmd_test(&file, password.as_deref()),
         Cmd::Delete { file, entries, password } => {
@@ -94,9 +94,25 @@ fn cmd_list(path: &Path) -> io::Result<String> {
     Ok(out)
 }
 
-fn cmd_extract(path: &Path, dest: &Path, password: Option<&str>) -> io::Result<String> {
-    let report = ops::extract(path, dest, password.map(|s| s.as_bytes()))?;
+fn cmd_extract(
+    path: &Path,
+    dest: &Path,
+    password: Option<&str>,
+    include: &[String],
+    exclude: &[String],
+) -> io::Result<String> {
+    let report = if include.is_empty() && exclude.is_empty() {
+        ops::extract(path, dest, password.map(|s| s.as_bytes()))?
+    } else {
+        ops::extract_filtered(path, dest, password.map(|s| s.as_bytes()), include, exclude)?
+    };
     let mut out = format!("extracted {} files to {}", report.files, dest.display());
+    if !include.is_empty() {
+        out.push_str(&format!(" (include: {})", include.join(", ")));
+    }
+    if !exclude.is_empty() {
+        out.push_str(&format!(" (exclude: {})", exclude.join(", ")));
+    }
     if report.skipped_encrypted > 0 {
         out.push_str(&format!(" ({} skipped: encrypted)", report.skipped_encrypted));
     }
@@ -118,23 +134,7 @@ fn cmd_compress(
 ) -> io::Result<String> {
     let fmt = match format {
         None => None,
-        Some(s) => Some(match s.to_lowercase().as_str() {
-            "zip" => ops::OutFormat::Zip,
-            "7z" => ops::OutFormat::SevenZ,
-            "tar" => ops::OutFormat::Tar,
-            "tar.gz" | "tgz" => ops::OutFormat::TarGz,
-            "tar.xz" | "txz" => ops::OutFormat::TarXz,
-            "tar.bz2" | "tbz2" => ops::OutFormat::TarBz2,
-            "gz" => ops::OutFormat::Gz,
-            "xz" => ops::OutFormat::Xz,
-            "bz2" => ops::OutFormat::Bz2,
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("unknown format '{}' (zip/7z/tar/tar.gz/tar.xz/tar.bz2/gz/xz/bz2)", other),
-                ))
-            }
-        }),
+        Some(s) => Some(ops::OutFormat::parse_out_format(s)?),
     };
     let report = ops::compress_as(&files, out, password.map(|s| s.as_bytes()), level, fmt)?;
     Ok(format!("added {} files, {} -> {}", report.files, human(report.bytes), out.display()))
@@ -206,13 +206,36 @@ fn cmd_crack(
     charset_spec: &str,
     min_len: usize,
     max_len: usize,
+    mask: Option<&str>,
     dictionary: Option<&Path>,
     threads: usize,
     quiet: bool,
 ) -> io::Result<String> {
-    // Non-ZIP formats: shell out to 7z per candidate.
+    // Non-ZIP formats: native in-process 7z candidate verification.
     if archive::detect_format(path)? != archive::Format::Zip {
-        return crack_via_sevenz(path, dictionary, charset_spec, min_len, max_len, quiet);
+        return crack_via_sevenz(path, dictionary, mask, charset_spec, min_len, max_len, quiet);
+    }
+
+    if let Some(pat) = mask {
+        let plan = ops::prepare_crack(path)?;
+        println!(
+            "target: {} [{}] entry `{}`, {} threads, mode: mask `{}`",
+            path.display(), plan.kind, plan.entry_name, threads, pat
+        );
+        println!("space: {} candidates", rosezip_core::charset::MaskGen::parse(pat)
+            .map(|m| m.total).unwrap_or(0));
+        let opts = CrackOptions { threads, quiet };
+        let start = std::time::Instant::now();
+        let result = crack::crack_mask(pat, plan.verifier, &opts)?;
+        let elapsed = start.elapsed().as_secs_f64();
+        return Ok(match &result.password {
+            Some(pw) => format!(
+                "FOUND password: \"{}\"\ntried {} candidates in {:.2}s ({:.0}/s)",
+                String::from_utf8_lossy(pw), result.tried, elapsed,
+                result.tried as f64 / elapsed.max(1e-9)
+            ),
+            None => format!("password not found; tried {} candidates in {:.2}s", result.tried, elapsed),
+        });
     }
 
     let plan = ops::prepare_crack(path)?;
@@ -261,50 +284,174 @@ fn cmd_crack(
 }
 
 /// Password attack for non-ZIP formats — native, in-process 7z decoding
-/// (~1-2ms per candidate vs ~50/s with an external binary).
+/// (~1-2ms per candidate vs ~50/s with an external binary). Candidates are
+/// verified on all CPU threads; dictionary, brute force and mask modes.
 fn crack_via_sevenz(
     path: &Path,
     dictionary: Option<&Path>,
+    mask: Option<&str>,
     charset_spec: &str,
     min_len: usize,
     max_len: usize,
     quiet: bool,
 ) -> io::Result<String> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
     if archive::detect_format(path)? != archive::Format::SevenZ {
         return Err(ops::bad("native password attack supports 7z; tar/gz/xz/bz2 have no encryption"));
     }
     let start = std::time::Instant::now();
-    let mut tried: u64 = 0;
     let mut result: Option<Vec<u8>> = None;
+    let mut tried: u64 = 0;
 
-    if let Some(dict) = dictionary {
-        let words = std::fs::read_to_string(dict)?;
-        for line in words.lines() {
-            let pw = line.trim_end_matches('\r');
-            tried += 1;
-            if !quiet && tried % 20 == 0 {
-                eprint!("\rtried {} ({:.0}/s)", tried, tried as f64 / start.elapsed().as_secs_f64().max(1e-9));
+    // Ticker on the main thread while workers verify candidates.
+    let tick = |found_not_empty: bool, handles: &[std::thread::ScopedJoinHandle<'_, ()>], counter: &AtomicU64| {
+        let n = counter.load(Ordering::Relaxed);
+        if !quiet && n > 0 {
+            eprint!("\rtried {} ({:.0}/s)", n, n as f64 / start.elapsed().as_secs_f64().max(1e-9));
+        }
+        found_not_empty || handles.iter().all(|h| h.is_finished())
+    };
+
+    std::thread::scope(|scope| {
+        // Each candidate costs a full AES-256 key derivation, so the stream
+        // is shared across worker threads with a static split.
+        let attempt = |pw: &[u8]| archive::sevenz_test_password(path, pw).unwrap_or(false);
+
+        if let Some(dict) = dictionary {
+            // Split at line boundaries; each worker owns a contiguous region.
+            let data: &'static [u8] = crack::load_dictionary(dict)?;
+            let threads = crack::num_cpus();
+            let bounds = line_bounds(data, threads);
+            let found: Arc<Mutex<Option<Vec<u8>>>> = Default::default();
+            let tried_counter = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let region = &data[bounds[t]..bounds[t + 1]];
+                let found = found.clone();
+                let tried_counter = tried_counter.clone();
+                let stop = stop.clone();
+                handles.push(scope.spawn(move || {
+                    for word in region.split(|&b| b == b'\n') {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let word = word.strip_suffix(b"\r").unwrap_or(word);
+                        if word.is_empty() {
+                            continue;
+                        }
+                        tried_counter.fetch_add(1, Ordering::Relaxed);
+                        if attempt(word) {
+                            let mut g = found.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(word.to_vec());
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }));
             }
-            if archive::sevenz_test_password(path, pw.as_bytes())? {
-                result = Some(pw.as_bytes().to_vec());
-                break;
+            loop {
+                let done = tick(found.lock().unwrap().is_some(), &handles, &tried_counter);
+                if done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+            result = found.lock().unwrap().take();
+            tried = tried_counter.load(Ordering::Relaxed);
+        } else {
+            // Brute force or mask: static split of the index space, workers
+            // pull candidates by index and verify in-process. `index_at` maps
+            // an index to its candidate; it must be Clone to fan out to the
+            // workers (the IndexGen/MaskGen behind it are cheap clones).
+            fn run_stream<'scope, 'env, F>(
+                scope: &'scope std::thread::Scope<'scope, 'env>,
+                gen_total: u64,
+                quiet: bool,
+                start: &std::time::Instant,
+                index_at: F,
+                attempt: impl Fn(&[u8]) -> bool + Send + Sync + Copy + 'env,
+                result: &mut Option<Vec<u8>>,
+                tried: &mut u64,
+            ) where
+                F: Fn(u64) -> Vec<u8> + Send + Sync + Clone + 'env,
+            {
+                use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+                use std::sync::{Arc, Mutex};
+
+                let threads = crack::num_cpus();
+                let found: Arc<Mutex<Option<Vec<u8>>>> = Default::default();
+                let tried_counter = Arc::new(AtomicU64::new(0));
+                let stop = Arc::new(AtomicBool::new(false));
+                let chunk = gen_total / threads as u64 + 1;
+                let mut handles = Vec::new();
+                for t in 0..threads {
+                    let found = found.clone();
+                    let tried_counter = tried_counter.clone();
+                    let stop = stop.clone();
+                    let index_at = index_at.clone();
+                    handles.push(scope.spawn(move || {
+                        let lo = (t as u64) * chunk;
+                        let hi = (lo + chunk).min(gen_total);
+                        for idx in lo..hi {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let pw = index_at(idx);
+                            tried_counter.fetch_add(1, Ordering::Relaxed);
+                            if attempt(&pw) {
+                                let mut g = found.lock().unwrap();
+                                if g.is_none() {
+                                    *g = Some(pw);
+                                }
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }));
+                }
+                loop {
+                    let n = tried_counter.load(Ordering::Relaxed);
+                    if !quiet && n > 0 {
+                        eprint!("\rtried {} ({:.0}/s)", n, n as f64 / start.elapsed().as_secs_f64().max(1e-9));
+                    }
+                    if found.lock().unwrap().is_some() || handles.iter().all(|h| h.is_finished()) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                for h in handles {
+                    let _ = h.join();
+                }
+                *result = found.lock().unwrap().take();
+                *tried = tried_counter.load(Ordering::Relaxed);
+            }
+
+            if let Some(pat) = mask {
+                let mg = rosezip_core::charset::MaskGen::parse(pat).map_err(|e| ops::bad(&e))?;
+                println!("note: 7z = AES-256 + key derivation, native attack is slow; prefer -d <dictionary>");
+                println!("space: {} candidates from mask", mg.total);
+                run_stream(scope, mg.total, quiet, &start,
+                    move |idx| mg.password_at(idx).as_slice().to_vec(),
+                    attempt, &mut result, &mut tried);
+            } else {
+                let gen = ops::make_gen(charset_spec, min_len, max_len)?;
+                println!("note: 7z = AES-256 + key derivation, native attack is slow; prefer -d <dictionary>");
+                run_stream(scope, gen.total, quiet, &start,
+                    move |idx| gen.password_at(idx).as_slice().to_vec(),
+                    attempt, &mut result, &mut tried);
             }
         }
-    } else {
-        let gen = ops::make_gen(charset_spec, min_len, max_len)?;
-        println!("note: 7z = AES-256 + key derivation, native attack is ~500/s; prefer -d <dictionary>");
-        for idx in 0..gen.total {
-            let cand = gen.password_at(idx);
-            tried += 1;
-            if !quiet && tried % 20 == 0 {
-                eprint!("\rtried {} ({:.0}/s)", tried, tried as f64 / start.elapsed().as_secs_f64().max(1e-9));
-            }
-            if archive::sevenz_test_password(path, cand.as_slice())? {
-                result = Some(cand.as_slice().to_vec());
-                break;
-            }
-        }
-    }
+        Ok::<(), io::Error>(())
+    })?;
+
     let elapsed = start.elapsed().as_secs_f64();
     Ok(match result {
         Some(pw) => format!(
@@ -315,6 +462,22 @@ fn crack_via_sevenz(
         ),
         None => format!("password not found; tried {} candidates in {:.2}s", tried, elapsed),
     })
+}
+
+/// Split a byte slice at `\n` boundaries into `n` roughly equal regions.
+fn line_bounds(data: &[u8], n: usize) -> Vec<usize> {
+    let mut bounds = Vec::with_capacity(n + 1);
+    bounds.push(0usize);
+    for _ in 1..n {
+        let approx = (bounds.last().unwrap() + data.len() / n).min(data.len());
+        let nl = match data[approx..].iter().position(|&b| b == b'\n') {
+            Some(p) => approx + p + 1,
+            None => data.len(),
+        };
+        bounds.push(nl);
+    }
+    bounds.push(data.len());
+    bounds
 }
 
 fn human(n: u64) -> String {

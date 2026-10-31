@@ -360,6 +360,26 @@ fn estimate_space(charset: String, min_len: usize, max_len: usize) -> Result<Spa
     Ok(SpaceEstimate { total, total_pretty: format!("{} 个候选", pretty) })
 }
 
+/// Estimate the mask-pattern search space for UI display.
+#[tauri::command]
+fn estimate_mask_space(pattern: String) -> Result<SpaceEstimate, String> {
+    let mask = rosezip_core::charset::MaskGen::parse(pattern.trim())
+        .map_err(|e| e.to_string())?;
+    let total = mask.total;
+    let pretty = if total >= 1_000_000_000_000 {
+        format!("{:.2}T", total as f64 / 1e12)
+    } else if total >= 1_000_000_000 {
+        format!("{:.2}G", total as f64 / 1e9)
+    } else if total >= 1_000_000 {
+        format!("{:.2}M", total as f64 / 1e6)
+    } else if total >= 1_000 {
+        format!("{:.1}K", total as f64 / 1e3)
+    } else {
+        total.to_string()
+    };
+    Ok(SpaceEstimate { total, total_pretty: format!("{} 个候选", pretty) })
+}
+
 #[tauri::command]
 fn crack_start(
     path: String,
@@ -368,6 +388,8 @@ fn crack_start(
     min_len: Option<usize>,
     max_len: Option<usize>,
     dictionary: Option<String>,
+    // Mask pattern for `mode == "mask"` (e.g. `Rose?d?d?d?d`)
+    mask: Option<String>,
     threads: Option<usize>,
     job: State<'_, JobSlot>,
 ) -> Result<StatusDto, String> {
@@ -430,6 +452,15 @@ fn crack_start(
     let plan = ops::prepare_crack(&p).map_err(|e| e.to_string())?;
     let target = match (mode.as_str(), dictionary) {
         ("dictionary", Some(d)) => CrackTarget::Dictionary { path: PathBuf::from(d) },
+        // Mask pattern attack: `Rose?d?d?d?d` style.
+        ("mask", _) => {
+            let pat = mask
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| "mask 模式需要 mask 参数（如 Rose?d?d?d?d）".to_string())?;
+            let m = rosezip_core::charset::MaskGen::parse(pat).map_err(|e| e.to_string())?;
+            CrackTarget::Mask { mask: m }
+        }
         (_, d) if d.is_some() => CrackTarget::Dictionary { path: PathBuf::from(d.unwrap()) },
         _ => {
             let gen = ops::make_gen(
@@ -515,6 +546,7 @@ pub fn run() {
             bench_speed,
             crack_prepare,
             estimate_space,
+            estimate_mask_space,
             crack_start,
             crack_status,
             crack_cancel,

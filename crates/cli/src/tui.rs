@@ -196,8 +196,11 @@ fn set_nonblocking(_on: bool) {}
 const MENU: &[&str] = &[
     "List / inspect archive",
     "Extract archive",
-    "Compress to ZIP",
+    "Compress to archive (zip/7z/tar…)",
     "Crack password",
+    "Test archive integrity",
+    "Delete entries",
+    "Rename entry",
     "Benchmark",
     "Quit",
 ];
@@ -231,7 +234,10 @@ fn main_loop(tui: &mut Tui) -> io::Result<()> {
                     1 => action_extract(tui)?,
                     2 => action_compress(tui)?,
                     3 => action_crack(tui)?,
-                    4 => action_bench(tui)?,
+                    4 => action_test(tui)?,
+                    5 => action_delete(tui)?,
+                    6 => action_rename(tui)?,
+                    7 => action_bench(tui)?,
                     _ => return Ok(()),
                 };
             }
@@ -359,12 +365,39 @@ fn action_compress(tui: &mut Tui) -> io::Result<String> {
     if inputs.is_empty() {
         return Ok("cancelled".into());
     }
-    let out = prompt_line_default(tui, "output zip [out.zip]: ", "out.zip")?;
-    let pw = prompt_line(tui, "password (empty = none): ")?;
+    let out = prompt_line_default(tui, "output path [out.zip]: ", "out.zip")?;
+    let fmt = prompt_line_default(
+        tui,
+        "format (auto/zip/7z/tar/tar.gz/tar.xz/tar.bz2/gz/xz/bz2) [auto]: ",
+        "auto",
+    )?;
+    let pw = prompt_line(tui, "password (empty = none, zip/7z only): ")?;
     let level: u32 =
-        prompt_line_default(tui, "deflate level 0-9 [6]: ", "6")?.parse().unwrap_or(6);
+        prompt_line_default(tui, "compression level 0-9 [6]: ", "6")?.parse().unwrap_or(6);
     let files: Vec<PathBuf> = inputs.split_whitespace().map(PathBuf::from).collect();
-    match ops::compress(&files, PathBuf::from(&out).as_path(), if pw.is_empty() { None } else { Some(pw.as_bytes()) }, level) {
+    let fmt = match fmt.to_lowercase().as_str() {
+        "" | "auto" => None,
+        other => Some(other.to_string()),
+    };
+    let result = match fmt {
+        None => ops::compress(
+            &files,
+            PathBuf::from(&out).as_path(),
+            if pw.is_empty() { None } else { Some(pw.as_bytes()) },
+            level,
+        ),
+        Some(f) => {
+            let of = ops::parse_out_format(&f)?;
+            ops::compress_as(
+                &files,
+                PathBuf::from(&out).as_path(),
+                if pw.is_empty() { None } else { Some(pw.as_bytes()) },
+                level,
+                Some(of),
+            )
+        }
+    };
+    match result {
         Ok(report) => {
             let msg = format!("added {} files, {} -> {}", report.files, human(report.bytes), out);
             tui.print(&format!("\r\n{}\r\n", msg));
@@ -401,7 +434,7 @@ fn action_crack(tui: &mut Tui) -> io::Result<String> {
     tui.print(&format!(
         "\r\ntarget entry `{}` — {}\r\n\r\n", plan.entry_name, plan.kind
     ));
-    tui.print("1) dictionary  2) brute force\r\n");
+    tui.print("1) dictionary  2) brute force  3) mask pattern\r\n");
     let mode = prompt_line_default(tui, "mode [2]: ", "2")?;
     let mode = if mode.is_empty() { "2".to_string() } else { mode };
 
@@ -413,6 +446,18 @@ fn action_crack(tui: &mut Tui) -> io::Result<String> {
             return Ok("cancelled".into());
         }
         let target = CrackTarget::Dictionary { path: PathBuf::from(dict) };
+        run_job_ui(tui, target, plan.verifier.clone(), threads)
+    } else if mode == "3" {
+        let pat = prompt_line(tui, "mask (e.g. Rose?d?d?d?d — ?l ?u ?d ?s ?a ?h ?H): ")?;
+        if pat.is_empty() {
+            return Ok("cancelled".into());
+        }
+        let mask = match rosezip_core::charset::MaskGen::parse(&pat) {
+            Ok(m) => m,
+            Err(e) => return Ok(format!("error: {}", e)),
+        };
+        tui.print(&format!("space: {}\r\n", human_count(mask.total)));
+        let target = CrackTarget::Mask { mask };
         run_job_ui(tui, target, plan.verifier.clone(), threads)
     } else {
         let cs = prompt_line_default(tui, "charset (lower/digits/…, or lower+digits) [lower]: ", "lower")?;
@@ -474,6 +519,93 @@ fn run_job_ui(
             return Ok(msg);
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test / Delete / Rename (parity with the CLI and GUI)
+// ---------------------------------------------------------------------------
+
+fn prompt_archive(tui: &mut Tui) -> io::Result<Option<PathBuf>> {
+    let path = prompt_line(tui, "archive path: ")?;
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        tui.print(&format!("\r\nerror: file not found: {}\r\n", path));
+        pause(tui)?;
+        return Ok(None);
+    }
+    Ok(Some(p))
+}
+
+fn action_test(tui: &mut Tui) -> io::Result<String> {
+    let Some(p) = prompt_archive(tui)? else {
+        return Ok("cancelled".into());
+    };
+    let pw = prompt_line(tui, "password (empty = none): ")?;
+    match ops::test_archive(&p, if pw.is_empty() { None } else { Some(pw.as_bytes()) }) {
+        Ok(rep) => {
+            let msg = if rep.errors.is_empty() {
+                format!("OK: {} files verified", rep.files)
+            } else {
+                format!("FAILED: {} ok, {} error(s): {}", rep.files, rep.errors.len(),
+                    rep.errors.iter().take(5).cloned().collect::<Vec<_>>().join("; "))
+            };
+            tui.print(&format!("\r\n{}\r\n", msg));
+            pause(tui)?;
+            Ok(msg)
+        }
+        Err(e) => Ok(format!("error: {}", e)),
+    }
+}
+
+fn action_delete(tui: &mut Tui) -> io::Result<String> {
+    let Some(p) = prompt_archive(tui)? else {
+        return Ok("cancelled".into());
+    };
+    let entries = prompt_line(tui, "entries to delete (space separated, `dir/` = folder): ")?;
+    if entries.is_empty() {
+        return Ok("cancelled".into());
+    }
+    let pw = prompt_line(tui, "password (empty = none): ")?;
+    let names: Vec<String> = entries.split_whitespace().map(str::to_owned).collect();
+    match ops::delete_entries(&p, &names, if pw.is_empty() { None } else { Some(pw.as_bytes()) }) {
+        Ok(n) => {
+            let msg = format!("deleted {} entr{} from {}", n, if n == 1 { "y" } else { "ies" }, p.display());
+            tui.print(&format!("\r\n{}\r\n", msg));
+            pause(tui)?;
+            Ok(msg)
+        }
+        Err(e) => Ok(format!("error: {}", e)),
+    }
+}
+
+fn action_rename(tui: &mut Tui) -> io::Result<String> {
+    let Some(p) = prompt_archive(tui)? else {
+        return Ok("cancelled".into());
+    };
+    let pairs = prompt_line(tui, "OLD=NEW pairs (space separated): ")?;
+    if pairs.is_empty() {
+        return Ok("cancelled".into());
+    }
+    let pw = prompt_line(tui, "password (empty = none): ")?;
+    let mut renames = Vec::new();
+    for pair in pairs.split_whitespace() {
+        match pair.split_once('=') {
+            Some((old, new)) if !new.is_empty() => renames.push((old.to_owned(), new.to_owned())),
+            _ => return Ok(format!("error: rename pair must be OLD=NEW, got '{}'", pair)),
+        }
+    }
+    match ops::rename_entries(&p, &renames, if pw.is_empty() { None } else { Some(pw.as_bytes()) }) {
+        Ok(n) => {
+            let msg = format!("renamed {} entr{} in {}", n, if n == 1 { "y" } else { "ies" }, p.display());
+            tui.print(&format!("\r\n{}\r\n", msg));
+            pause(tui)?;
+            Ok(msg)
+        }
+        Err(e) => Ok(format!("error: {}", e)),
     }
 }
 

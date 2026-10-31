@@ -10,4 +10,5 @@ pub mod ops;
 pub mod progress;
 pub mod zipcrypt;
 
+pub use charset::MaskGen;
 pub use crack::{spawn_job, CrackHandle, CrackOptions, CrackResult, CrackStatus, CrackTarget};

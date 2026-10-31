@@ -46,6 +46,85 @@ pub fn resolve_charset(spec: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Mask-pattern generator: `?l?l?d?d` style placeholders interleaved with
+/// literal text (`Rose2024` → `Rose?d?d?d?d`). High value when part of the
+/// password is known — the search space shrinks by orders of magnitude.
+///
+/// Placeholders: `?l` lower, `?u` upper, `?d` digits, `?s` symbols,
+/// `?a` alnum, `?A` all, `?h` hex lower, `?H` hex upper, `?b` base-62.
+/// `??` escapes a literal `?`; any other char is a literal.
+#[derive(Clone)]
+pub struct MaskGen {
+    /// One charset per position; a literal becomes a single-byte set.
+    pub slots: Vec<Vec<u8>>,
+    /// total candidates = product of every slot's charset size
+    pub total: u64,
+}
+
+impl MaskGen {
+    pub fn parse(pattern: &str) -> Result<Self, String> {
+        let b = pattern.as_bytes();
+        let mut slots: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'?' {
+                if i + 1 >= b.len() {
+                    return Err("dangling `?` at end of mask".into());
+                }
+                let set = match b[i + 1] {
+                    b'?' => vec![b'?'],
+                    b'l' => LOWER.as_bytes().to_vec(),
+                    b'u' => UPPER.as_bytes().to_vec(),
+                    b'd' => DIGITS.as_bytes().to_vec(),
+                    b's' => SYMBOLS.as_bytes().to_vec(),
+                    b'a' => charset_by_name("alnum").unwrap().as_bytes().to_vec(),
+                    b'A' => charset_by_name("all").unwrap().as_bytes().to_vec(),
+                    b'h' => b"0123456789abcdef".to_vec(),
+                    b'H' => b"0123456789ABCDEF".to_vec(),
+                    b'b' => charset_by_name("alnum").unwrap().as_bytes().to_vec(),
+                    other => {
+                        return Err(format!("unknown mask placeholder `?{}`", other as char));
+                    }
+                };
+                slots.push(set);
+                i += 2;
+            } else {
+                slots.push(vec![b[i]]);
+                i += 1;
+            }
+        }
+        if slots.is_empty() {
+            return Err("empty mask".into());
+        }
+        if slots.len() > 32 {
+            return Err("mask longer than 32 positions".into());
+        }
+        let mut total: u64 = 1;
+        for s in &slots {
+            total = total
+                .checked_mul(s.len() as u64)
+                .ok_or("search space too large for u64 indexing")?;
+        }
+        if total == 0 {
+            return Err("empty search space".into());
+        }
+        Ok(Self { slots, total })
+    }
+
+    /// Map an integer in [0, total) to its password bytes.
+    pub fn password_at(&self, mut idx: u64) -> Candidate {
+        let mut buf = [0u8; 32];
+        let mut len = self.slots.len();
+        for (i, slot) in self.slots.iter().enumerate().rev() {
+            buf[i] = slot[(idx % slot.len() as u64) as usize];
+            idx /= slot.len() as u64;
+        }
+        // slots.len() <= 32 is enforced in parse, so len always fits.
+        len = len.min(32);
+        Candidate { bytes: buf, len: len as u8 }
+    }
+}
+
 /// One candidate password currently being tried.
 #[derive(Clone)]
 pub struct Candidate {

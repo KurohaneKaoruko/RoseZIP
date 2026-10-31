@@ -17,9 +17,11 @@
   - 重命名条目 / 目录（支持中文等 UTF-8 名称）
   - CLI：`rosezip delete`、`rosezip rename OLD=NEW`
   - GUI：右键条目 → 解压所选 / 复制路径 / 重命名 / 删除
+  - TUI：列表 / 解压 / 压缩 / 爆破 / 测试 / 删除 / 重命名 / 基准 全功能菜单
 - **时间戳保留**：解压 ZIP 时恢复修改时间（DOS 时间）
-- **多线程密码爆破**：暴力破解（可配置字符集与长度）+ 字典攻击
-- **7z 密码攻击**：进程内逐候选解码验证（~30ms/次），无需系统 7z
+- **多线程密码爆破**：暴力破解（可配置字符集与长度）+ **掩码模式**（`Rose?d?d?d?d`
+  按位定制，大幅缩小搜索空间）+ 字典攻击
+- **7z 密码攻击**：进程内逐候选解码验证（~30ms/次），多线程并行，支持字典与掩码，无需系统 7z
 - **性能**：4 线程下 ZipCrypto 约 **17–20M 密码/秒**（见下方数据）
 
 ## 三种前端
@@ -61,13 +63,16 @@ rosezip check archive.zip
 # 解压（原生 ZIP 路径，含加密 ZIP）
 rosezip extract archive.zip -o out_dir -p 密码
 
+# 选择性解压：--include / --exclude 前缀过滤（exclude 优先于 include）
+rosezip extract archive.zip -o out_dir --include docs/ --exclude docs/drafts/
+
 # 创建 ZIP（level 0-9）
 rosezip compress 文件或目录 -o out.zip
 rosezip compress dir -o enc.zip -p 密码     # 原生 ZipCrypto 加密，unzip/7z 均可解
 
 # 其他格式（-F 或按 -o 扩展名自动推断）
 rosezip compress dir -o out.7z -p 密码      # 7z LZMA2 + AES-256 + 加密头
-rosezip compress dir -o out.tar.gz          # tar.gz / tar.xz / tar.bz2 / tar 同理
+rosezip compress dir -o out.tar.gz -l 9     # level 同样作用于 7z/gz/xz/bz2
 rosezip compress big.bin -F xz -o big.xz    # 单流压缩
 
 # 归档编辑（就地改写）
@@ -81,9 +86,13 @@ rosezip test archive.zip -p 密码            # 密码可省略（无加密时�
 # 爆破 ZipCrypto：小写+数字，1~6 位
 rosezip crack archive.zip -c lower+digits -n 1 -x 6
 
-# 字典攻击（支持 AES 与 7z 格式）
+# 掩码攻击：已知部分密码时按位定制（如 Rose2024 = Rose+4位数字）
+rosezip crack archive.zip -m 'Rose?d?d?d?d'
+
+# 字典攻击（支持 AES 与 7z 格式；7z 路径多线程并行验证）
 rosezip crack archive.zip -d wordlist.txt
 rosezip crack archive.7z -d wordlist.txt
+rosezip crack archive.7z -m 'Pass?d?d?d'    # 7z 也支持掩码
 
 # 基准测试
 rosezip bench
@@ -92,7 +101,8 @@ rosezip bench
 ### TUI（无参数启动）
 
 `rosezip` 直接回车进入交互界面：方向键选功能、回车确认、Esc/q 退出，
-支持列表 / 解压 / 压缩 / 爆破（实时进度 + 任意时刻取消）/ 基准测试。
+支持列表 / 解压 / 压缩（格式与等级可选）/ 爆破（暴力 / 字典 / 掩码，实时进度 +
+任意时刻取消）/ 完整性测试 / 条目删除与重命名 / 基准测试。
 在非 TTY 环境（如管道）下会报错退出，属预期行为。
 
 ### 字符集写法
@@ -103,6 +113,18 @@ rosezip bench
 | `lower+digits` | 组合（36 个字符） |
 | `abc123` | 任意字面字符集 |
 | `all` | 全部可打印 ASCII 符号 |
+
+### 掩码占位符
+
+| 占位符 | 含义 | | 占位符 | 含义 |
+|---|---|---|---|---|
+| `?l` | 小写字母 | | `?a` | 字母+数字 |
+| `?u` | 大写字母 | | `?A` | 全部字符 |
+| `?d` | 数字 | | `?h` / `?H` | 十六进制（小/大写） |
+| `?s` | 符号 | | `??` | 字面 `?` |
+
+其余字符按字面处理：`Rose?d?d?d?d` 枚举 `Rose0000`…`Rose9999`（1 万候选，
+比同长度纯暴力小若干个数量级）。
 
 ## 性能实测（4 核 AMD Ryzen R2314）
 
