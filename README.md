@@ -75,6 +75,9 @@ rosezip delete archive.zip dir/             # 删除整个目录（含条目）
 rosezip delete archive.zip a.txt b.txt
 rosezip rename archive.zip 旧名.txt=新名.txt
 
+# 完整性测试（解码全部条目并校验 CRC，不写盘）
+rosezip test archive.zip -p 密码            # 密码可省略（无加密时）
+
 # 爆破 ZipCrypto：小写+数字，1~6 位
 rosezip crack archive.zip -c lower+digits -n 1 -x 6
 
@@ -146,6 +149,9 @@ app/                桌面版
 └── src-tauri/      Tauri 2 后端（IPC 命令 + 破解任务管理）
 ```
 
+`rosezip test` 会对 ZIP 逐条目解压校验 CRC；7z 走全量解码校验；
+tar/gz/xz/bz2 走完整解包探测。测试失败以非零退出码结束，可直接用于 CI。
+
 ### GUI 与引擎的并发模型
 
 GUI 通过 `crack_start` 启动后台爆破任务（`crack::spawn_job`），
@@ -157,6 +163,27 @@ GUI 通过 `crack_start` 启动后台爆破任务（`crack::spawn_job`），
 
 仅用于恢复自己拥有的文件的密码。未经授权破解他人文件在大多数司法
 辖区属于违法行为。
+
+## 开发
+
+```bash
+# 调试构建（CLI + TUI + 引擎）
+cargo build
+
+# 运行全部单元测试与集成测试（无需外部测试数据，自动生成临时归档）
+cargo test
+
+# 本地验证 CLI
+./target/debug/rosezip list some.zip
+./target/debug/rosezip test some.zip
+```
+
+代码结构约定：
+
+- 引擎（`crates/core`）不含任何 UI 代码；CLI/TUI/GUI 只是薄封装
+- ZIP 写出、就地编辑（delete/rename）均为手写字节级实现，
+  改动时请运行 `cargo test -p rosezip-core` 覆盖的 round-trip 用例
+- 集成测试在 `crates/core/tests/edit_test.rs`，自包含（临时目录 + 自产归档）
 
 ## 许可证
 

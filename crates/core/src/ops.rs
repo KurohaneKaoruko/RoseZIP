@@ -47,6 +47,7 @@ fn write_zip_dir(
     let mut lfh = [0u8; 30];
     lfh[..4].copy_from_slice(b"PK\x03\x04");
     lfh[4..6].copy_from_slice(&20u16.to_le_bytes());
+    lfh[6..8].copy_from_slice(&efs_flag(name).to_le_bytes());
     lfh[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
     writer.write_all(&lfh)?;
     writer.write_all(name.as_bytes())?;
@@ -256,10 +257,11 @@ pub fn test_archive(path: &Path, password: Option<&[u8]>) -> io::Result<TestRepo
             })
         }
         _ => {
-            // tar/gz/xz/bz2: decode to /dev/null equivalent (temp buffer).
-            let tmp = std::env::temp_dir().join("rosezip-test-probe");
-            archive::extract_native(path, &tmp, None)?;
+            // tar/gz/xz/bz2: decode to a scratch dir, then discard.
+            let tmp = std::env::temp_dir().join(format!("rosezip-test-{}", std::process::id()));
+            let res = archive::extract_native(path, &tmp, None);
             let _ = fs::remove_dir_all(&tmp);
+            res?;
             Ok(TestReport { files: 1, errors: Vec::new() })
         }
     }
@@ -792,7 +794,7 @@ fn create_zip(
         // Plain payload vs ZipCrypto-encrypted (12-byte header + payload).
         // EFS (bit 11) marks UTF-8 entry names — set whenever the name is
         // not pure ASCII so 7-Zip/unzip decode it correctly.
-        let efs = 0x800u16 * is_ascii_name(&name) as u16;
+        let efs = efs_flag(&name);
         let (flags, stored): (u16, Vec<u8>) = match password {
             Some(pw) => {
                 let mut z = ZipCrypto::new(pw);
@@ -1319,4 +1321,76 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 pub fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn efs_flag_only_for_non_ascii() {
+        assert_eq!(efs_flag("plain.txt"), 0);
+        assert_eq!(efs_flag("中文.txt"), 0x800);
+        assert_eq!(efs_flag("dir/文件"), 0x800);
+    }
+
+    #[test]
+    fn safe_entry_path_contains_traversal() {
+        let dest = Path::new("/tmp/opencode/dest");
+        for evil in [
+            "../escape",
+            "..\\escape",
+            "/absolute/path",
+            "a/../../b",
+            "a/./b/",
+            "..",
+            "",
+        ] {
+            let p = safe_entry_path(dest, evil);
+            assert!(p.starts_with(dest), "{:?} -> {:?}", evil, p);
+        }
+        // benign names pass through
+        assert_eq!(safe_entry_path(dest, "a/b/c.txt"), dest.join("a/b/c.txt"));
+    }
+
+    #[test]
+    fn out_format_from_path() {
+        assert_eq!(OutFormat::from_path(Path::new("a.zip")), OutFormat::Zip);
+        assert_eq!(OutFormat::from_path(Path::new("a.7z")), OutFormat::SevenZ);
+        assert_eq!(OutFormat::from_path(Path::new("a.tar")), OutFormat::Tar);
+        assert_eq!(OutFormat::from_path(Path::new("a.tar.gz")), OutFormat::TarGz);
+        assert_eq!(OutFormat::from_path(Path::new("a.tgz")), OutFormat::TarGz);
+        assert_eq!(OutFormat::from_path(Path::new("a.tar.xz")), OutFormat::TarXz);
+        assert_eq!(OutFormat::from_path(Path::new("a.tar.bz2")), OutFormat::TarBz2);
+        assert_eq!(OutFormat::from_path(Path::new("a.gz")), OutFormat::Gz);
+        assert_eq!(OutFormat::from_path(Path::new("a.xz")), OutFormat::Xz);
+        assert_eq!(OutFormat::from_path(Path::new("a.bz2")), OutFormat::Bz2);
+        // unknown extension falls back to ZIP
+        assert_eq!(OutFormat::from_path(Path::new("a.bin")), OutFormat::Zip);
+        // ".tar.gz" must win over ".gz" (ordering of the checks)
+        assert_ne!(OutFormat::from_path(Path::new("x.tar.gz")), OutFormat::Gz);
+    }
+
+    #[test]
+    fn dos_timestamp_roundtrip() {
+        let (t, d) = dos_now();
+        // 2-second granularity of the DOS time field
+        let unix = archive::dos_datetime_to_unix(d, t) as i64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((now - unix).abs() <= 2, "unix={} now={}", unix, now);
+        // invalid month / hour must map to 0 rather than panicking
+        assert_eq!(archive::dos_datetime_to_unix(0, 0), 0);
+    }
+
+    #[test]
+    fn matches_any_patterns() {
+        assert!(matches_any("a.txt", &["a.txt".into()]));
+        assert!(matches_any("dir/sub/f.txt", &["dir/".into()]));
+        assert!(matches_any("dir/", &["dir/".into()]));
+        assert!(!matches_any("other/a.txt", &["dir/".into()]));
+        assert!(!matches_any("a.txt", &[]));
+    }
 }

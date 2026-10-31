@@ -131,4 +131,36 @@ mod tests {
         assert_eq!(resolve_charset("lower+digits").unwrap().len(), 36);
         assert_eq!(resolve_charset("abc").unwrap(), b"abc".to_vec());
     }
+
+    #[test]
+    fn resolve_unknown_name_errors() {
+        // `nope` is a legal literal charset (chars n-o-p-e); only '+'-composed
+        // unknown names are rejected.
+        assert!(resolve_charset("lower+nope").is_err());
+        assert!(resolve_charset("").is_err());
+        // duplicate chars in combined sets collapse
+        assert_eq!(resolve_charset("digits+digits").unwrap(), b"0123456789".to_vec());
+        assert_eq!(resolve_charset("digits").unwrap(), b"0123456789".to_vec());
+    }
+
+    #[test]
+    fn gen_total_and_length_bounds() {
+        let g = IndexGen::new(b"ab".to_vec(), 2, 2).unwrap();
+        assert_eq!(g.total, 4);
+        assert_eq!(g.password_at(3).as_slice(), b"bb");
+        // full range 1..=2
+        let g = IndexGen::new(b"ab".to_vec(), 1, 2).unwrap();
+        assert_eq!(g.password_at(g.total - 1).as_slice(), b"bb");
+        // an impossibly large space must error instead of wrapping
+        assert!(IndexGen::new(b"ab".to_vec(), 1, 200).is_err());
+        assert!(IndexGen::new(vec![], 1, 4).is_err());
+    }
+
+    #[test]
+    fn candidate_display() {
+        let c = IndexGen::new(b"ab".to_vec(), 1, 1).unwrap().password_at(0);
+        assert_eq!(c.len, 1);
+        assert_eq!(c.as_slice(), b"a");
+        assert_eq!(c.to_string(), "a");
+    }
 }

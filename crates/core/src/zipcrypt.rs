@@ -864,7 +864,6 @@ mod tests {
 #[cfg(test)]
 mod integration_debug {
     use super::*;
-    use crate::archive::ZipEntry;
 
     /// Exact reproduction of the cmd_crack path against the real file.
     #[test]
