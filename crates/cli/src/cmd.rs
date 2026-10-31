@@ -51,7 +51,8 @@ fn cmd_rename(file: &Path, pairs: &[String], password: Option<&str>) -> io::Resu
     Ok(format!("renamed {} entr{} in {}", n, if n == 1 { "y" } else { "ies" }, file.display()))
 }
 
-fn cmd_test(path: &Path, password: Option<&str>) -> io::Result<String> {    let report = ops::test_archive(path, password.map(|s| s.as_bytes()))?;
+fn cmd_test(path: &Path, password: Option<&str>) -> io::Result<String> {
+    let report = ops::test_archive(path, password.map(|s| s.as_bytes()))?;
     if report.errors.is_empty() {
         Ok(format!(
             "test ok: {} entries verified, no errors\nchecksums match — archive is healthy",
@@ -74,7 +75,8 @@ fn cmd_list(path: &Path) -> io::Result<String> {
     let (mut tp, mut ts, mut n) = (0u64, 0u64, 0);
     for e in &view.entries {
         if e.is_dir {
-            out.push_str(&format!("     {:>10} {:>10}  {}/\n", "-", "-", e.name));
+            // names already end with '/'; don't double it
+            out.push_str(&format!("     {:>10} {:>10}  {}\n", "-", "-", e.name));
             continue;
         }
         n += 1;
@@ -83,8 +85,8 @@ fn cmd_list(path: &Path) -> io::Result<String> {
         out.push_str(&format!(
             "{:<4} {:>10} {:>10}  {}\n",
             if e.encrypted { "*" } else { "" },
-            human(tp.min(e.compressed_size).max(e.compressed_size)),
-            human(ts.min(e.uncompressed_size).max(e.uncompressed_size)),
+            human(e.compressed_size),
+            human(e.uncompressed_size),
             e.name
         ));
     }

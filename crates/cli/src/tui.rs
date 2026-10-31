@@ -304,7 +304,7 @@ fn action_list(tui: &mut Tui) -> io::Result<String> {
             let mut n = 0;
             for e in &view.entries {
                 if e.is_dir {
-                    tui.print(&format!("     {:>10} {:>10}  {}/\r\n", "-", "-", e.name));
+                    tui.print(&format!("     {:>10} {:>10}  {}\r\n", "-", "-", e.name));
                 } else {
                     n += 1;
                     tui.print(&format!(

@@ -181,9 +181,8 @@ pub fn parse_zip_central_directory(file: &mut fs::File) -> io::Result<Vec<ZipEnt
         });
         off += 46 + name_len + extra_len + comment_len;
     }
-    if entries.is_empty() {
-        return Err(bad("no entries found in central directory"));
-    }
+    // An empty central directory is legal (PKWARE APPNOTE): `rosezip delete`
+    // of every entry must produce a readable empty archive, not an error.
     Ok(entries)
 }
 
@@ -602,4 +601,79 @@ fn extract_bz2(archive: &Path, dest: &Path) -> io::Result<()> {
     }
     fs::write(out_path, out)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rosezip-ut-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn detect_format_by_magic() {
+        let dir = tmp("detect");
+        let cases: &[(&str, &[u8], Format)] = &[
+            ("a.zip", b"PK\x03\x04rest", Format::Zip),
+            ("a.7z", b"7z\xbc\xaf\x27\x1crest", Format::SevenZ),
+            ("a.gz", b"\x1f\x8b\x08rest", Format::Gz),
+            ("a.bz2", b"BZh9rest", Format::Bz2),
+            ("a.xz", b"\xfd7zXZ\x00rest", Format::Xz),
+        ];
+        for (name, magic, want) in cases {
+            let p = dir.join(name);
+            fs::write(&p, magic).unwrap();
+            assert_eq!(detect_format(&p).unwrap(), *want, "{}", name);
+        }
+        // minimal ustar: magic lives at offset 257
+        let mut tar = vec![0u8; 512];
+        tar[257..262].copy_from_slice(b"ustar");
+        let p = dir.join("a.tar");
+        fs::write(&p, &tar).unwrap();
+        assert_eq!(detect_format(&p).unwrap(), Format::Tar);
+        // unknown magic is an error, not a panic
+        let p = dir.join("junk");
+        fs::write(&p, b"0123456789").unwrap();
+        assert!(detect_format(&p).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dos_datetime_to_unix_known_values() {
+        // 1980-01-01 00:00:00 — the DOS epoch
+        let dos_date = (0u16 << 9) | (1 << 5) | 1;
+        assert_eq!(dos_datetime_to_unix(dos_date, 0), 315532800);
+        // 2023-11-14 22:13:20 UTC = 1700000000 (year field = 2023-1980)
+        let dos_date = (43u16 << 9) | (11 << 5) | 14;
+        let dos_time = (22u16 << 11) | (13 << 5) | 10;
+        assert_eq!(dos_datetime_to_unix(dos_date, dos_time), 1_700_000_000);
+        // leap year: 2024-02-29 (year field 44 = 2024)
+        let dos_date = (44u16 << 9) | (2 << 5) | 29;
+        assert_eq!(dos_datetime_to_unix(dos_date, 0), 1_709_164_800);
+        // invalid fields collapse to 0
+        assert_eq!(dos_datetime_to_unix(0, 0), 0);
+        let bad_month = (44u16 << 9) | (13 << 5) | 1;
+        assert_eq!(dos_datetime_to_unix(bad_month, 0), 0);
+    }
+
+    #[test]
+    fn crc32_known_vector() {
+        // canonical CRC-32 of "123456789"
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn inflate_roundtrip() {
+        let data = b"hello hello hello hello hello".repeat(16);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &data).unwrap();
+        let packed = enc.finish().unwrap();
+        let out = inflate(&packed, data.len() as u64).unwrap();
+        assert_eq!(out, data);
+    }
 }
