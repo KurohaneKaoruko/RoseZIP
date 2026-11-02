@@ -13,7 +13,7 @@ permissions:
   contents: write # Release 上传需要
 
 env:
-  APP_VERSION: "0.1.0"
+  APP_VERSION: "0.1.1"
 
 jobs:
   # -----------------------------------------------------------------
