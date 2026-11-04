@@ -287,6 +287,7 @@ fn bench_speed() -> Result<BenchDto, String> {
         is_dir: false,
         dos_time: 0x98b,
         dos_date: 0x5B99,
+        aes_inner_method: 8,
     };
     let verifier = Arc::new(
         Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x98b))
