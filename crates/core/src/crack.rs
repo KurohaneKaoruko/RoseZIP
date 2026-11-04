@@ -302,12 +302,22 @@ fn run_mask_workers(
         handles.push(thread::spawn(move || {
             let start = (t as u64) * chunk;
             let end = (start + chunk).min(total);
+            // Batch the shared counter like the other hot loops: one atomic
+            // RMW per candidate caused heavy cache-line contention between
+            // workers on the fast ZipCrypto path.
+            let mut local_done = 0u64;
             for idx in start..end {
-                if stop.load(Ordering::Relaxed) {
-                    break;
+                if local_done >= 8192 {
+                    progress.done.fetch_add(local_done, Ordering::Relaxed);
+                    local_done = 0;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
                 let cand = mask.password_at(idx);
                 if verifier.quick_check(cand.as_slice()) && verifier.confirm(cand.as_slice()) {
+                    local_done += 1;
+                    progress.done.fetch_add(local_done, Ordering::Relaxed);
                     let mut g = found.lock().unwrap();
                     if g.is_none() {
                         *g = Some(cand.as_slice().to_vec());
@@ -316,8 +326,9 @@ fn run_mask_workers(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                progress.done.fetch_add(1, Ordering::Relaxed);
+                local_done += 1;
             }
+            progress.done.fetch_add(local_done, Ordering::Relaxed);
         }));
     }
     for h in handles {

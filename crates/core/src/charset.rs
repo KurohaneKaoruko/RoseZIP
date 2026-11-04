@@ -38,7 +38,12 @@ pub fn resolve_charset(spec: &str) -> Result<Vec<u8>, String> {
     } else if let Some(s) = charset_by_name(spec) {
         Ok(s.as_bytes().to_vec())
     } else {
-        let set = spec.as_bytes().to_vec();
+        let mut set: Vec<u8> = Vec::new();
+        for &b in spec.as_bytes() {
+            if !set.contains(&b) {
+                set.push(b);
+            }
+        }
         if set.is_empty() {
             return Err("charset must not be empty".into());
         }
@@ -220,6 +225,9 @@ mod tests {
         // duplicate chars in combined sets collapse
         assert_eq!(resolve_charset("digits+digits").unwrap(), b"0123456789".to_vec());
         assert_eq!(resolve_charset("digits").unwrap(), b"0123456789".to_vec());
+        // literal sets dedupe too, otherwise the search space double-counts
+        assert_eq!(resolve_charset("abcabc").unwrap(), b"abc".to_vec());
+        assert_eq!(resolve_charset("1122").unwrap(), b"12".to_vec());
     }
 
     #[test]
