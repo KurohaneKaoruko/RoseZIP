@@ -321,13 +321,13 @@ fn test_one_zip_entry(
     let content = match entry.method {
         0 => plain,
         8 => archive::inflate(&plain, entry.uncompressed_size)?,
-        99 => match archive::inflate(&plain, entry.uncompressed_size) {
-            Ok(out) => out,
-            Err(_) => plain,
-        },
+        // WinZip AES: `decrypt_winzip_aes` has already decoded the inner
+        // stream (inflate/store per the 0x9901 method) and validated it.
+        99 => plain,
         m => return Err(bad(&format!("unsupported compression method {}", m))),
     };
-    if entry.method != 99 && archive::crc32(&content) != entry.crc32 {
+    // AE-2 entries legitimately store CRC 0; skip only that documented case.
+    if entry.crc32 != 0 && archive::crc32(&content) != entry.crc32 {
         return Err(bad("CRC mismatch (wrong password?)"));
     }
     Ok(())
@@ -469,13 +469,13 @@ pub(crate) fn extract_one_zip_entry(
     let content = match entry.method {
         0 => plain,
         8 => archive::inflate(&plain, entry.uncompressed_size)?,
-        99 => match archive::inflate(&plain, entry.uncompressed_size) {
-            Ok(out) => out,
-            Err(_) => plain,
-        },
+        // WinZip AES: `decrypt_winzip_aes` has already decoded the inner
+        // stream (inflate/store per the 0x9901 method) and validated it.
+        99 => plain,
         m => return Err(bad(&format!("unsupported compression method {}", m))),
     };
-    if entry.method != 99 && archive::crc32(&content) != entry.crc32 {
+    // AE-2 entries legitimately store CRC 0; skip only that documented case.
+    if entry.crc32 != 0 && archive::crc32(&content) != entry.crc32 {
         return Err(bad("CRC mismatch (wrong password?)"));
     }
     let out_path = safe_entry_path(dest, &entry.name);
@@ -537,7 +537,13 @@ fn decrypt_winzip_aes(entry: &ZipEntry, raw: &[u8], pw: &[u8]) -> io::Result<Vec
         if computed[..10] != mac[..] {
             continue;
         }
-        // Try both CTR endiannesses (7z writes LE, WinZip spec says BE).
+        // The inner stream uses the *real* compression method from the 0x9901
+        // extra field (`aes_inner_method`), not the outer method 99. 7-Zip
+        // stores small files as Store+AES; misreading it as deflate used to
+        // corrupt every such entry. The counter starts at 1 (7-Zip increments
+        // before use, little-endian across u32 words; the WinZip spec variant
+        // is the big-endian equivalent) — try both, verify via CRC.
+        let inner = entry.aes_inner_method;
         for le in [true, false] {
             let mut iv = [0u8; 16];
             if le {
@@ -552,18 +558,45 @@ fn decrypt_winzip_aes(entry: &ZipEntry, raw: &[u8], pw: &[u8]) -> io::Result<Vec
             };
             let mut plain = cipher.to_vec();
             ctr.apply(&mut plain);
-            if entry.method == 99 {
-                if archive::inflate(&plain, entry.uncompressed_size).is_ok() {
+            match inner {
+                8 => {
+                    if let Ok(out) = archive::inflate(&plain, entry.uncompressed_size) {
+                        // 7-Zip zeroes the CRC of AES entries even though it
+                        // computed one, so with CRC==0 accept an inflate that
+                        // yields exactly the announced size.
+                        if entry.crc32 == 0 {
+                            if out.len() == entry.uncompressed_size as usize {
+                                return Ok(out);
+                            }
+                        } else if archive::crc32(&out) == entry.crc32 {
+                            return Ok(out);
+                        }
+                    }
+                }
+                0 => {
+                    if entry.crc32 == 0 {
+                        // No CRC to check (7-Zip always zeroes it for AES):
+                        // the HMAC already authenticated the ciphertext, so
+                        // take the little-endian (7-Zip) variant.
+                        return Ok(plain);
+                    } else if archive::crc32(&plain) == entry.crc32 {
+                        return Ok(plain);
+                    }
+                }
+                m => {
+                    let _ = m;
+                    // Unknown inner method: pass the decrypted stream through
+                    // and let the caller's method dispatch report it.
                     return Ok(plain);
                 }
-            } else if archive::crc32(&plain) == entry.crc32 {
-                return Ok(plain);
             }
         }
-        // Neither variant validated but HMAC passed: return the spec variant.
+        // Neither CTR variant validated but the HMAC is a 2^-80 check and
+        // already passed: return the little-endian (7-Zip) counter variant,
+        // which is what real-world AES ZIP writers use.
         let mut iv = [0u8; 16];
-        iv[15] = 1;
-        let mut ctr = zipcrypt::AesCtr::new(zipcrypt::Aes::new(aes_key), iv);
+        iv[0] = 1;
+        let mut ctr = zipcrypt::AesCtr::new_little_endian(zipcrypt::Aes::new(aes_key), iv);
         let mut plain = cipher.to_vec();
         ctr.apply(&mut plain);
         return Ok(plain);
