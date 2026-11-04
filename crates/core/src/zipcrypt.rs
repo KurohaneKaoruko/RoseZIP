@@ -601,7 +601,9 @@ impl Verifier {
                 key_len: strength.key_len(),
                 cipher: data[sl + 2..data.len() - 10].to_vec(),
                 mac,
-                method: entry.method,
+                // inner stream method (outer is 99) — required for the
+                // post-HMAC CRC confirm to pick the right decode
+                method: entry.aes_inner_method,
                 crc32: entry.crc32,
                 uncompressed_size: entry.uncompressed_size,
             })
@@ -764,23 +766,32 @@ impl Verifier {
             };
             let mut plain = cipher.clone();
             ctr.apply(&mut plain);
+            // `method` is the *inner* compression method copied from
+            // `aes_inner_method` in Verifier::prepare (outer method is 99).
+            // 7-Zip zeroes the CRC of AES entries; when it is 0 we accept by
+            // structural validation instead (inflate + exact size, or the
+            // Store variant that the HMAC already authenticated).
             match method {
                 8 => {
                     if let Ok(out) = crate::archive::inflate(&plain, *uncompressed_size) {
-                        if crc32(&out) == *want_crc {
+                        if out.len() == *uncompressed_size as usize
+                            && (*want_crc == 0 || crc32(&out) == *want_crc)
+                        {
                             return true;
                         }
                     }
                 }
                 0 => {
-                    if crc32(&plain) == *want_crc {
+                    if *want_crc == 0 || crc32(&plain) == *want_crc {
                         return true;
                     }
                 }
                 _ => {}
             }
         }
-        false
+        // HMAC (2^-80) already matched: accept unless AE-1 demands a CRC we
+        // could not confirm (unknown inner method or missing CRC stream).
+        *want_crc == 0
     }
 }
 
@@ -849,6 +860,7 @@ mod tests {
             is_dir: false,
             dos_time: 0x098b,
             dos_date: 0x5B99,
+            aes_inner_method: 8,
         };
         // 12 bytes captured from an Info-ZIP archive with password "ab"
         let data: [u8; 16] = [

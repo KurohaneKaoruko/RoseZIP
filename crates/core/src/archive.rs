@@ -106,6 +106,10 @@ pub struct ZipEntry {
     pub dos_time: u16,
     /// DOS mod-date (date half of the same timestamp)
     pub dos_date: u16,
+    /// For WinZip AES entries (outer method 99): the real compression method
+    /// of the inner stream, read from the 0x9901 extra field. Equals `method`
+    /// for every non-AES entry.
+    pub aes_inner_method: u16,
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -167,6 +171,24 @@ pub fn parse_zip_central_directory(file: &mut fs::File) -> io::Result<Vec<ZipEnt
         let comment_len = rd16(&cd, off + 32) as usize;
         let header_offset = rd32(&cd, off + 42) as u64;
         let name = String::from_utf8_lossy(&cd[off + 46..off + 46 + name_len]).into_owned();
+        // WinZip AES: the outer method is 99; the real compression method of
+        // the inner stream lives in the 0x9901 extra field. Default to Store
+        // (0) when the field is missing — that is what every real writer
+        // stores and the only value that keeps AES entries decodable.
+        let mut aes_inner_method = if method == 99 { 0 } else { method };
+        {
+            let extra = &cd[off + 46 + name_len..off + 46 + name_len + extra_len];
+            let mut eo = 0usize;
+            while eo + 4 <= extra.len() {
+                let id = rd16(extra, eo);
+                let sz = rd16(extra, eo + 2) as usize;
+                if id == 0x9901 && sz >= 7 && eo + 4 + 7 <= extra.len() {
+                    aes_inner_method = rd16(extra, eo + 9);
+                    break;
+                }
+                eo += 4 + sz;
+            }
+        }
         entries.push(ZipEntry {
             encrypted: flags & 0x1 != 0,
             is_dir: name.ends_with('/'),
@@ -178,6 +200,7 @@ pub fn parse_zip_central_directory(file: &mut fs::File) -> io::Result<Vec<ZipEnt
             crc32,
             dos_time,
             dos_date,
+            aes_inner_method,
         });
         off += 46 + name_len + extra_len + comment_len;
     }

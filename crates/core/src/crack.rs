@@ -671,6 +671,7 @@ mod job_tests {
             is_dir: false,
             dos_time: 0x098b,
             dos_date: 0x5B99,
+            aes_inner_method: 8,
         };
         let v = std::sync::Arc::new(
             Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x098b)).unwrap(),
