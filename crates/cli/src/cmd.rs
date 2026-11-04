@@ -166,6 +166,7 @@ fn cmd_bench() -> io::Result<String> {
         is_dir: false,
         dos_time: 0x98b,
         dos_date: 0x5B99,
+        aes_inner_method: 8,
     };
     let verifier = std::sync::Arc::new(
         rosezip_core::zipcrypt::Verifier::prepare(&entry, &vec![0u8; 32], None, Some(0x98b))
