@@ -206,6 +206,7 @@ fn compress_archive(
     password: Option<String>,
     level: Option<u32>,
     format: Option<String>,
+    encryption: Option<String>,
 ) -> Result<ReportDto, String> {
     let inputs: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
     let pw = password.filter(|s| !s.is_empty());
@@ -225,7 +226,19 @@ fn compress_archive(
             other => return Err(format!("未知格式: {}", other)),
         }),
     };
-    match ops::compress_as(&inputs, &PathBuf::from(&out), pw_bytes, level.unwrap_or(6), fmt) {
+    // ZIP encryption scheme (None/ZipCrypto/WinZip AES variants). Ignored for
+    // non-ZIP output — compress_as_enc validates that combination.
+    let enc = ops::ZipEncryption::from_str(encryption.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?
+        .unwrap_or(ops::ZipEncryption::None);
+    match ops::compress_as_enc(
+        &inputs,
+        &PathBuf::from(&out),
+        pw_bytes,
+        level.unwrap_or(6),
+        fmt,
+        enc,
+    ) {
         Ok(r) => Ok(ReportDto {
             ok: true,
             message: format!("已添加 {} 个文件（{} 字节）→ {}", r.files, r.bytes, out),
