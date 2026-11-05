@@ -165,6 +165,14 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
         ? "留空不加密 · ZIP 加密"
         : "该格式不支持加密";
 
+  const ENCRYPTIONS = [
+    ["aes", "AES-256 (推荐)"],
+    ["zipcrypto", "ZipCrypto (传统)"],
+    ["aes256-ae1", "AES-256 AE-1"],
+    ["aes128", "AES-128"],
+    ["aes128-ae1", "AES-128 AE-1"],
+  ];
+
   function addPaths(paths) {
     setFiles((prev) => [...new Set([...prev, ...paths])]);
   }
@@ -180,6 +188,7 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
         password: password || null,
         level: Number(level),
         format: format === "auto" ? null : format,
+        encryption: encryption || null,
       });
       setResult(r);
       if (r.ok) onDone?.(r);
@@ -326,6 +335,25 @@ export function CompressDialog({ onClose, onDone, pickFiles, pickFolder, pickSav
             disabled={busy}
           />
         </div>
+        {(format === "zip" || format === "auto") && (
+          <div className="frow">
+            <span className="frow-label">加密</span>
+            <div className="frow-main row-tight">
+              <select
+                className="input grow"
+                value={encryption}
+                onChange={(e) => setEncryption(e.target.value)}
+                disabled={busy || !password}
+              >
+                {ENCRYPTIONS.map(([v, l]) => (
+                  <option key={v} value={v}>
+                    {l}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
         <div className="frow">
           <span className="frow-label">级别</span>
           <div className="frow-main seg-tight">
