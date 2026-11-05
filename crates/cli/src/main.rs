@@ -50,6 +50,13 @@ enum Cmd {
         /// Output format (default: inferred from -o extension, else zip)
         #[arg(short = 'F', long)]
         format: Option<String>,
+        /// ZIP encryption scheme (zipcrypto | aes | aes256-ae1 | aes128 | aes128-ae1).
+        /// `--aes` with no value = WinZip AES-256 AE-2 (what 7-Zip writes).
+        #[arg(long = "aes", num_args = 0..=1, default_missing_value = "aes256", conflicts_with = "zipcrypto")]
+        aes: Option<String>,
+        /// Legacy ZipCrypto instead of AES
+        #[arg(long = "zipcrypto")]
+        zipcrypto: bool,
     },
     /// Show archive info and encryption type
     Check { file: std::path::PathBuf },

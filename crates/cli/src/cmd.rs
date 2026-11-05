@@ -15,8 +15,8 @@ pub fn dispatch(cmd: Cmd) -> io::Result<String> {
             let dest = out_dir.unwrap_or_else(|| PathBuf::from("."));
             cmd_extract(&file, &dest, password.as_deref(), &include, &exclude)
         }
-        Cmd::Compress { files, out, password, level, format } => {
-            cmd_compress(files, &out, password.as_deref(), level, format.as_deref())
+        Cmd::Compress { files, out, password, level, format, aes, zipcrypto } => {
+            cmd_compress(files, &out, password.as_deref(), level, format.as_deref(), aes.as_deref(), zipcrypto)
         }
         Cmd::Check { file } => cmd_check(&file),
         Cmd::Bench => cmd_bench(),
@@ -131,12 +131,30 @@ fn cmd_compress(
     password: Option<&str>,
     level: u32,
     format: Option<&str>,
+    aes: Option<&str>,
+    zipcrypto: bool,
 ) -> io::Result<String> {
     let fmt = match format {
         None => None,
         Some(s) => Some(ops::OutFormat::parse_out_format(s)?),
     };
-    let report = ops::compress_as(&files, out, password.map(|s| s.as_bytes()), level, fmt)?;
+    // Resolve the ZIP encryption scheme: --aes <scheme> wins, bare
+    // --zipcrypto selects legacy ZipCrypto. `aes` alone with a password
+    // defaults to WinZip AES-256 AE-2.
+    let enc = match (aes, zipcrypto) {
+        (Some(spec), _) => ops::ZipEncryption::from_str(spec)?,
+        (None, true) => Some(ops::ZipEncryption::ZipCrypto),
+        (None, false) => None,
+    };
+    let pw = password.map(|s| s.as_bytes());
+    let report = ops::compress_as_enc(
+        &files,
+        out,
+        pw,
+        level,
+        fmt,
+        enc.unwrap_or(ops::ZipEncryption::None),
+    )?;
     Ok(format!("added {} files, {} -> {}", report.files, human(report.bytes), out.display()))
 }
 
