@@ -20,6 +20,15 @@ struct CdRecord {
     dos_time: u16,
     dos_date: u16,
     encrypted: bool,
+    /// extra field bytes already written in the local header (0 for most
+    /// entries, 11 for WinZip AES ones) — mirrored into the central record
+    /// so readers can find the 0x9901 field either place.
+    extra_len: u16,
+    /// real compression method for AES entries (from the 0x9901 field),
+    /// equals `method` otherwise.
+    aes_inner_method: u16,
+    /// 0x9901 strength id (1/2/3) for AES entries, 0 otherwise.
+    aes_strength_id: u8,
 }
 
 /// 0x800 when the name needs the UTF-8 (EFS) flag, 0 when pure ASCII.
@@ -61,6 +70,9 @@ fn write_zip_dir(
         dos_time,
         dos_date,
         encrypted: false,
+        extra_len: 0,
+        aes_inner_method: 0,
+        aes_strength_id: 0,
     });
     Ok(())
 }
@@ -605,12 +617,58 @@ fn decrypt_winzip_aes(entry: &ZipEntry, raw: &[u8], pw: &[u8]) -> io::Result<Vec
 }
 
 // ---------------------------------------------------------------------------
-// Compress (native ZIP writer, optional ZipCrypto encryption)
+// Compress (native ZIP writer, optional ZipCrypto / WinZip AES encryption)
 // ---------------------------------------------------------------------------
 
 pub struct CompressReport {
     pub files: usize,
     pub bytes: u64,
+}
+
+/// ZIP encryption scheme for the writer. `WinZipAes*` uses the strongest
+/// variant (AES-256) by default; AE-2 (no CRC) is the default protocol
+/// version, matching what 7-Zip writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZipEncryption {
+    None,
+    /// Legacy ZipCrypto (PKWARE stream cipher).
+    ZipCrypto,
+    /// WinZip AES-256, protocol AE-2 (CRC stored as 0).
+    WinZipAes,
+    /// WinZip AES-256, protocol AE-1 (real CRC stored).
+    WinZipAesAe1,
+    /// WinZip AES-128, protocol AE-2.
+    WinZipAes128,
+    /// WinZip AES-128, protocol AE-1.
+    WinZipAes128Ae1,
+}
+
+impl ZipEncryption {
+    pub fn from_str(s: &str) -> io::Result<Option<Self>> {
+        match s.to_lowercase().as_str() {
+            "" | "none" => Ok(None),
+            "zipcrypto" | "zip" => Ok(Some(Self::ZipCrypto)),
+            "aes" | "aes256" => Ok(Some(Self::WinZipAes)),
+            "aes256-ae1" => Ok(Some(Self::WinZipAesAe1)),
+            "aes128" => Ok(Some(Self::WinZipAes128)),
+            "aes128-ae1" => Ok(Some(Self::WinZipAes128Ae1)),
+            other => Err(bad(&format!(
+                "unknown encryption scheme '{}' (none/zipcrypto/aes/aes256-ae1/aes128/aes128-ae1)",
+                other
+            ))),
+        }
+    }
+
+    fn scheme(self) -> Option<(AesStrength, bool)> {
+        // (strength, keep_crc?) — keep_crc selects AE-1; dropping it is AE-2.
+        match self {
+            Self::None | Self::ZipCrypto => None,
+            Self::WinZipAes => Some((AesStrength::Aes256, false)),
+            Self::WinZipAesAe1 => Some((AesStrength::Aes256, true)),
+            Self::WinZipAes128 => Some((AesStrength::Aes128, false)),
+            Self::WinZipAes128Ae1 => Some((AesStrength::Aes128, true)),
+        }
+    }
 }
 
 pub fn compress(
@@ -620,6 +678,24 @@ pub fn compress(
     level: u32,
 ) -> io::Result<CompressReport> {
     compress_as(inputs, out, password, level, None)
+}
+
+/// Compress to ZIP with an explicit encryption scheme. Default AES is
+/// AE-2/AES-256 (the variant 7-Zip writes).
+pub fn compress_zip(
+    inputs: &[PathBuf],
+    out: &Path,
+    password: Option<&[u8]>,
+    level: u32,
+    enc: ZipEncryption,
+) -> io::Result<CompressReport> {
+    if password.is_none() {
+        if enc != ZipEncryption::None {
+            return Err(bad("encryption scheme set but no password given"));
+        }
+        return create_zip(inputs, out, None, level, ZipEncryption::None);
+    }
+    create_zip(inputs, out, password, level, enc)
 }
 
 /// Compression output format, inferred from the file extension when not given.
@@ -689,14 +765,27 @@ pub fn parse_out_format(s: &str) -> io::Result<OutFormat> {
 }
 
 /// Compress to any supported output format. `password` applies to ZIP
-/// (ZipCrypto) and 7z (AES-256, header also encrypted); it is ignored for
-/// tar/gz/xz/bz2 which have no encryption concept.
+/// (ZipCrypto by default, or WinZip AES when `enc` requests it) and 7z
+/// (AES-256, header also encrypted); it is ignored for tar/gz/xz/bz2 which
+/// have no encryption concept.
 pub fn compress_as(
     inputs: &[PathBuf],
     out: &Path,
     password: Option<&[u8]>,
     level: u32,
     format: Option<OutFormat>,
+) -> io::Result<CompressReport> {
+    compress_as_enc(inputs, out, password, level, format, ZipEncryption::None)
+}
+
+/// Like `compress_as`, with an explicit ZIP encryption scheme.
+pub fn compress_as_enc(
+    inputs: &[PathBuf],
+    out: &Path,
+    password: Option<&[u8]>,
+    level: u32,
+    format: Option<OutFormat>,
+    enc: ZipEncryption,
 ) -> io::Result<CompressReport> {
     if inputs.is_empty() {
         return Err(bad("no input files given"));
@@ -706,9 +795,12 @@ pub fn compress_as(
             return Err(bad(&format!("input not found: {}", f.display())));
         }
     }
+    if enc != ZipEncryption::None && password.is_none() {
+        return Err(bad("encryption scheme set but no password given"));
+    }
     let fmt = format.unwrap_or_else(|| OutFormat::from_path(out));
     match fmt {
-        OutFormat::Zip => create_zip(inputs, out, password, level),
+        OutFormat::Zip => create_zip(inputs, out, password, level, enc),
         OutFormat::SevenZ => create_7z(inputs, out, password, level),
         OutFormat::Tar => create_tar(inputs, out, None),
         OutFormat::TarGz => create_tar(inputs, out, Some(("gz", level))),
@@ -915,6 +1007,7 @@ fn create_zip(
     out: &Path,
     password: Option<&[u8]>,
     level: u32,
+    enc: ZipEncryption,
 ) -> io::Result<CompressReport> {
     let mut writer = fs::File::create(out)?;
     let mut central: Vec<CdRecord> = Vec::new();
@@ -951,49 +1044,88 @@ fn create_zip(
         let offset = writer.stream_position()? as u32;
         let name_bytes = name.as_bytes();
 
-        // Plain payload vs ZipCrypto-encrypted (12-byte header + payload).
+        // Payload transform per encryption scheme:
+        //   None       — plain
+        //   ZipCrypto  — 12-byte check header + stream cipher
+        //   WinZip AES — salt + 2-byte password verifier + CTR ciphertext
+        //                + 10-byte HMAC; extra field 0x9901 carries the real
+        //                (inner) compression method, outer method becomes 99.
+        // AE-2 (default) stores the CRC as 0 — the CRC of a small known
+        // plaintext can leak information about the password; AE-1 keeps it.
         // EFS (bit 11) marks UTF-8 entry names — set whenever the name is
         // not pure ASCII so 7-Zip/unzip decode it correctly.
         let efs = efs_flag(&name);
-        let (flags, stored): (u16, Vec<u8>) = match password {
-            Some(pw) => {
-                let mut z = ZipCrypto::new(pw);
-                // check byte = hi byte of CRC (spec) — readers accept this
-                let mut plain = payload.clone();
-                let mut hdr = [0u8; 12];
-                hdr[11] = (crc >> 24) as u8;
-                plain.splice(..0, hdr.iter().copied());
-                z.encrypt(&mut plain);
-                (0x1 | efs, plain)
-            }
-            None => (efs, payload),
-        };
+        let (flags, method_out, cd_crc, stored, extra): (u16, u16, u32, Vec<u8>, Vec<u8>) =
+            match (password, enc) {
+                (Some(pw), ZipEncryption::None) | (Some(pw), ZipEncryption::ZipCrypto) => {
+                    let mut z = ZipCrypto::new(pw);
+                    // check byte = hi byte of CRC (spec) — readers accept this
+                    let mut plain = payload.clone();
+                    let mut hdr = [0u8; 12];
+                    hdr[11] = (crc >> 24) as u8;
+                    plain.splice(..0, hdr.iter().copied());
+                    z.encrypt(&mut plain);
+                    (0x1 | efs, method, crc, plain, Vec::new())
+                }
+                (Some(pw), scheme) => {
+                    let (strength, keep_crc) = scheme
+                        .scheme()
+                        .expect("validated: AES scheme always carries a password");
+                    let mut salt = vec![0u8; crate::aes_writer::salt_len(strength)];
+                    crate::aes_writer::random_bytes(&mut salt);
+                    let keys = crate::aes_writer::derive_keys(pw, &salt, strength);
+                    let mut body = payload.clone();
+                    let tag = crate::aes_writer::encrypt_payload(&keys, &mut body);
+                    let mut blob = salt;
+                    blob.extend_from_slice(&keys.pw_verify);
+                    blob.extend_from_slice(&body);
+                    blob.extend_from_slice(&tag);
+                    let ae_version = if keep_crc {
+                        crate::aes_writer::AE_VERSION_1
+                    } else {
+                        crate::aes_writer::AE_VERSION_2
+                    };
+                    let extra =
+                        crate::aes_writer::extra_field(ae_version, strength, method);
+                    (0x1 | efs, 99, if keep_crc { crc } else { 0 }, blob, extra)
+                }
+                (None, _) => (efs, method, crc, payload, Vec::new()),
+            };
 
         let mut lfh = [0u8; 30];
         lfh[..4].copy_from_slice(b"PK\x03\x04");
         lfh[4..6].copy_from_slice(&20u16.to_le_bytes());
         lfh[6..8].copy_from_slice(&flags.to_le_bytes());
-        lfh[8..10].copy_from_slice(&method.to_le_bytes());
+        lfh[8..10].copy_from_slice(&method_out.to_le_bytes());
         lfh[10..12].copy_from_slice(&dos_time.to_le_bytes());
         lfh[12..14].copy_from_slice(&dos_date.to_le_bytes());
-        lfh[14..18].copy_from_slice(&crc.to_le_bytes());
+        lfh[14..18].copy_from_slice(&cd_crc.to_le_bytes());
         lfh[18..22].copy_from_slice(&(stored.len() as u32).to_le_bytes());
         lfh[22..26].copy_from_slice(&usize_.to_le_bytes());
         lfh[26..28].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        lfh[28..30].copy_from_slice(&0u16.to_le_bytes());
+        lfh[28..30].copy_from_slice(&(extra.len() as u16).to_le_bytes());
         writer.write_all(&lfh)?;
         writer.write_all(name_bytes)?;
+        if !extra.is_empty() {
+            writer.write_all(&extra)?;
+        }
         writer.write_all(&stored)?;
         central.push(CdRecord {
             name,
-            method,
-            crc,
+            method: method_out,
+            crc: cd_crc,
             csize: stored.len() as u32,
             usize_,
             offset,
             dos_time,
             dos_date,
             encrypted: password.is_some(),
+            extra_len: extra.len() as u16,
+            aes_inner_method: if method_out == 99 { method } else { method_out },
+            aes_strength_id: match extra.get(8) {
+                Some(&id) if method_out == 99 => id,
+                _ => 0,
+            },
         });
         Ok(())
     };
@@ -1025,6 +1157,20 @@ fn create_zip(
 
     let cd_offset = writer.stream_position()? as u32;
     for e in &central {
+        // WinZip AES entries repeat the 0x9901 extra field in the central
+        // directory (that is where our own reader looks first).
+        let extra: Vec<u8> = if e.method == 99 && e.extra_len > 0 {
+            let ae_version = if e.crc == 0 {
+                crate::aes_writer::AE_VERSION_2
+            } else {
+                crate::aes_writer::AE_VERSION_1
+            };
+            let strength = AesStrength::from_id(e.aes_strength_id)
+                .expect("validated: strength id recorded from local extra");
+            crate::aes_writer::extra_field(ae_version, strength, e.aes_inner_method)
+        } else {
+            Vec::new()
+        };
         let mut cdh = [0u8; 46];
         cdh[..4].copy_from_slice(b"PK\x01\x02");
         cdh[4..6].copy_from_slice(&20u16.to_le_bytes());
@@ -1039,9 +1185,13 @@ fn create_zip(
         cdh[20..24].copy_from_slice(&e.csize.to_le_bytes());
         cdh[24..28].copy_from_slice(&e.usize_.to_le_bytes());
         cdh[28..30].copy_from_slice(&(e.name.len() as u16).to_le_bytes());
+        cdh[30..32].copy_from_slice(&(extra.len() as u16).to_le_bytes());
         cdh[42..46].copy_from_slice(&e.offset.to_le_bytes());
         writer.write_all(&cdh)?;
         writer.write_all(e.name.as_bytes())?;
+        if !extra.is_empty() {
+            writer.write_all(&extra)?;
+        }
     }
     let cd_size = writer.stream_position()? as u32 - cd_offset;
 
@@ -1201,6 +1351,9 @@ where
             dos_time: e.dos_time,
             dos_date: e.dos_date,
             encrypted: e.encrypted,
+            extra_len: 0,
+            aes_inner_method: e.aes_inner_method,
+            aes_strength_id: 0,
         });
     }
 

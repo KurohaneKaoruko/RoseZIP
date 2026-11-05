@@ -62,7 +62,7 @@ impl Sha1 {
         // Padding: 0x80, zeros to 56 mod 64, then 8-byte big-endian bit length.
         let mut pad = [0u8; 72];
         pad[0] = 0x80;
-        let zeros = (56 - (self.buf_len + 1) % 64) % 64;
+        let zeros = (56usize.wrapping_sub((self.buf_len + 1) % 64)) % 64;
         pad[1..1 + zeros].iter().for_each(|_| {});
         self.update(&pad[..1 + zeros]);
         self.update(&bit_len.to_be_bytes());
@@ -531,12 +531,13 @@ impl AesStrength {
 }
 
 /// WinZip AES iteration counts are fixed per strength.
+///
+/// The WinZip AES spec fixes the PBKDF2 iteration count at 1000 for *all*
+/// strengths (it is not stored in the archive); 7-Zip and pyzipper both
+/// write 1000. The old AES-192=10000 value broke interop with real writers.
 pub fn aes_iterations(strength: AesStrength) -> u32 {
-    match strength {
-        AesStrength::Aes128 => 1000,
-        AesStrength::Aes192 => 10000,
-        AesStrength::Aes256 => 1000,
-    }
+    let _ = strength;
+    1000
 }
 
 // ---------------------------------------------------------------------------
