@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -372,6 +372,11 @@ fn action_compress(tui: &mut Tui) -> io::Result<String> {
         "auto",
     )?;
     let pw = prompt_line(tui, "password (empty = none, zip/7z only): ")?;
+    let enc_prompt = prompt_line_default(
+        tui,
+        "zip encryption (none/zipcrypto/aes/aes256-ae1/aes128/aes128-ae1) [none]: ",
+        "none",
+    )?;
     let level: u32 =
         prompt_line_default(tui, "compression level 0-9 [6]: ", "6")?.parse().unwrap_or(6);
     let files: Vec<PathBuf> = inputs.split_whitespace().map(PathBuf::from).collect();
@@ -379,22 +384,30 @@ fn action_compress(tui: &mut Tui) -> io::Result<String> {
         "" | "auto" => None,
         other => Some(other.to_string()),
     };
+    let pw = if pw.is_empty() { None } else { Some(pw.as_bytes()) };
+    // Encryption applies to ZIP output only; other formats ignore it.
+    let enc = if pw.is_some() {
+        ops::ZipEncryption::from_str(&enc_prompt)?.unwrap_or(ops::ZipEncryption::None)
+    } else {
+        ops::ZipEncryption::None
+    };
+    let out_path = Path::new(&out);
     let result = match fmt {
-        None => ops::compress(
-            &files,
-            PathBuf::from(&out).as_path(),
-            if pw.is_empty() { None } else { Some(pw.as_bytes()) },
-            level,
-        ),
+        None => {
+            let of = ops::OutFormat::from_path(out_path);
+            if of == ops::OutFormat::Zip {
+                ops::compress_zip(&files, out_path, pw, level, enc)
+            } else {
+                ops::compress_as(&files, out_path, pw, level, Some(of))
+            }
+        }
         Some(f) => {
             let of = ops::parse_out_format(&f)?;
-            ops::compress_as(
-                &files,
-                PathBuf::from(&out).as_path(),
-                if pw.is_empty() { None } else { Some(pw.as_bytes()) },
-                level,
-                Some(of),
-            )
+            if of == ops::OutFormat::Zip {
+                ops::compress_zip(&files, out_path, pw, level, enc)
+            } else {
+                ops::compress_as(&files, out_path, pw, level, Some(of))
+            }
         }
     };
     match result {
