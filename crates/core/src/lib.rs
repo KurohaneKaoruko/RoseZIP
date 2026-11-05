@@ -3,6 +3,7 @@
 //!
 //! SPDX-License-Identifier: GPL-3.0-only
 
+pub mod aes_writer;
 pub mod archive;
 pub mod charset;
 pub mod crack;
