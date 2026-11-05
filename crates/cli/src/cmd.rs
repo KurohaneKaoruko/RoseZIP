@@ -121,6 +121,8 @@ fn cmd_extract(
         for e in report.errors.iter().take(10) {
             out.push_str(&format!("\n  {}", e));
         }
+        // 部分失败对脚本/CI 是错误（如密码错误导致 HMAC 校验失败）。
+        return Err(io::Error::new(io::ErrorKind::InvalidData, out));
     }
     Ok(out)
 }
